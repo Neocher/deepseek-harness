@@ -1,0 +1,5 @@
+# dsh-tool-taiji bundle — 太极调度工具层
+
+- insert:
+    - id: dsh-tool-taiji
+      name: '@deepseek-ai/dsh-tool-taiji'
