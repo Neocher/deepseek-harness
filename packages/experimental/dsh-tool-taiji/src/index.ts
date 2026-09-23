@@ -17,7 +17,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, unlinkSync } from 'node:fs'
 import { join, resolve, dirname, relative } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -32,7 +32,7 @@ export const inject = ['tools', 'subagents']
  * 注意: codex 从修复通道排除 — 本容器 codex app-server 的 bubblewrap 沙箱
  * 需 user namespaces 受限 (2026-09-01 实测), 仅保留 claude_code + opencode 修复。
  * codex 仍以 subagent_codex 独立承担复审门。 */
-const AGENT_PEAKS: Record<string, number> = {
+export const AGENT_PEAKS: Record<string, number> = {
   claude_code: 60,
   opencode: 90,
 }
@@ -108,17 +108,37 @@ function pheromonePath(workdir: string): string {
   return join(workdir, '.taiji', 'pheromones.json')
 }
 
-function loadPheromones(workdir: string): PheromoneMap {
+/** 落盘告警回调 (生产传 ctx.logger.warn, 测试/无 logger 时 console.warn 兜底)。 */
+type WarnFn = (message: string) => void
+
+/** 原子写 JSON: 写 `<path>.tmp-<pid>` → fsync → rename, 避免 writeFileSync 直接覆盖的半写损坏 (C4)。 */
+export function atomicWriteJson(path: string, data: unknown): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const tmp = `${path}.tmp-${process.pid}`
+  const fd = openSync(tmp, 'w')
+  try {
+    writeSync(fd, JSON.stringify(data, null, 2))
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  renameSync(tmp, path)
+}
+
+export function loadPheromones(workdir: string, warn: WarnFn = console.warn): PheromoneMap {
   const p = pheromonePath(workdir)
   try {
     if (existsSync(p)) return JSON.parse(readFileSync(p, 'utf-8')) as PheromoneMap
-  } catch { /* 忽略损坏, 重建 */ }
+  } catch {
+    // 损坏状态不再静默清零: 备份为 .corrupt-<ts> 并告警后重建 (C4)
+    try { renameSync(p, `${p}.corrupt-${Date.now()}`) } catch { /* 备份失败不阻断 */ }
+    warn(`[taiji] pheromones.json 损坏, 已备份为 ${p}.corrupt-*, 重建为空`)
+  }
   return {}
 }
 
-function savePheromones(workdir: string, pm: PheromoneMap): void {
-  mkdirSync(join(workdir, '.taiji'), { recursive: true })
-  writeFileSync(pheromonePath(workdir), JSON.stringify(pm, null, 2), 'utf-8')
+export function savePheromones(workdir: string, pm: PheromoneMap): void {
+  atomicWriteJson(pheromonePath(workdir), pm)
 }
 
 /** Pe 蒸发: 测试绿 → ×0.5 强遗忘; 测试红 → 不蒸发 */
@@ -149,10 +169,31 @@ function sprayWeighted(pm: PheromoneMap, failedFiles: string[]): PheromoneMap {
   return out
 }
 
+/** FNV-1a 32 位哈希 (确定性抖动种子, C6)。 */
+export function fnv1a(str: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
+}
+
+/** 竞标微扰 [0,1): 默认确定性 FNV-1a; env TAIJI_RANDOM_BID=1 恢复 Math.random (对照实验, C6)。 */
+export function bidJitter(seed: string): number {
+  if (process.env.TAIJI_RANDOM_BID === '1') return Math.random()
+  return fnv1a(seed) / 0x100000000
+}
+
 /** 高斯响应竞标: 每个 agent 有专长刺激区间, 概率微扰后排序 (降序)
  * 4.0 演进: 竞标分 × 信誉权重 (经验引导派单, 修复连续失败者权重下降,
  * 其它通道自动上位 — 修复通道从 claude 独占扩展为权重自动派单)。 */
-function auction(pm: PheromoneMap, workdir: string): { file: string; agents: string[]; stimulus: number } | undefined {
+function auction(
+  pm: PheromoneMap,
+  workdir: string,
+  gen: number,
+  warn: WarnFn = console.warn,
+): { file: string; agents: string[]; stimulus: number } | undefined {
   const candidates: string[] = []
   for (const [file, node] of Object.entries(pm)) {
     if (node.Pe > 0 || node.Pr > 0) candidates.push(file)
@@ -161,11 +202,12 @@ function auction(pm: PheromoneMap, workdir: string): { file: string; agents: str
   const file = candidates.reduce((a, b) =>
     (stimulusOf(pm[a] ?? zeroNode) > stimulusOf(pm[b] ?? zeroNode) ? a : b))
   const s = stimulusOf(pm[file] ?? zeroNode)
-  const weights = loadAgentWeights(workdir)
+  const weights = loadAgentWeights(workdir, warn)
   const scored: Array<[string, number]> = []
   for (const [agent, peak] of Object.entries(AGENT_PEAKS)) {
     const w = weights[agent] ?? 0
-    const score = Math.exp(-(((s - peak) / 60) ** 2)) * (0.85 + Math.random() * 0.3) * (1 + w * 0.2)
+    const jitter = bidJitter(`${workdir}\0${file}\0${agent}\0${gen}`)
+    const score = Math.exp(-(((s - peak) / 60) ** 2)) * (0.85 + jitter * 0.3) * (1 + w * 0.2)
     scored.push([agent, score])
   }
   scored.sort((a, b) => b[1] - a[1])
@@ -178,12 +220,16 @@ function auction(pm: PheromoneMap, workdir: string): { file: string; agents: str
 const AGENT_WEIGHTS_FILE = '.taiji/agent-weights.json'
 const WEIGHT_DECAY = 0.9
 
-function loadAgentWeights(workdir: string): Record<string, number> {
+export function loadAgentWeights(workdir: string, warn: WarnFn = console.warn): Record<string, number> {
+  const p = resolve(workdir, AGENT_WEIGHTS_FILE)
   try {
-    const p = resolve(workdir, AGENT_WEIGHTS_FILE)
-    const raw = readFileSync(p, 'utf8')
-    return JSON.parse(raw) as Record<string, number>
+    return JSON.parse(readFileSync(p, 'utf8')) as Record<string, number>
   } catch {
+    // 损坏权重文件不再静默清零 (C4): 备份 + 告警
+    if (existsSync(p)) {
+      try { renameSync(p, `${p}.corrupt-${Date.now()}`) } catch { /* 备份失败不阻断 */ }
+      warn('[taiji] agent-weights.json 损坏, 已备份为 .corrupt-*')
+    }
     return {}
   }
 }
@@ -191,51 +237,103 @@ function loadAgentWeights(workdir: string): Record<string, number> {
 function saveAgentWeights(workdir: string, w: Record<string, number>): void {
   try {
     const p = resolve(workdir, AGENT_WEIGHTS_FILE)
-    mkdirSync(dirname(p), { recursive: true })
-    writeFileSync(p, JSON.stringify(w, null, 2))
+    atomicWriteJson(p, w)
   } catch {
     /* 权重落盘失败不阻断循环 */
   }
 }
 
-function updateAgentWeight(workdir: string, agent: string, ok: boolean): void {
-  const w = loadAgentWeights(workdir)
+/** 复测后权重信号: 委派失败→0 (不双计); 复测绿→+1; 复测红或未复测→-1 (C3)。 */
+export function agentWeightDelta(rOk: boolean, t2: { ok: boolean } | undefined): number {
+  if (!rOk) return 0
+  return t2?.ok ? 1 : -1
+}
+
+export function updateAgentWeight(workdir: string, agent: string, delta: number, warn: WarnFn = console.warn): void {
+  if (delta === 0) return
+  const w = loadAgentWeights(workdir, warn)
   for (const k of Object.keys(w)) w[k] = Number(((w[k] ?? 0) * WEIGHT_DECAY).toFixed(3))
   const key = Object.keys(AGENT_PEAKS).find(a => a === agent) ?? agent
-  w[key] = Number(((w[key] ?? 0) + (ok ? 1 : -1)).toFixed(3))
+  w[key] = Number(((w[key] ?? 0) + delta).toFixed(3))
   saveAgentWeights(workdir, w)
 }
 function stimulusOf(node: PheromoneNode): number {
   return node.Pe + node.Pr * 0.5
 }
 
-/** 运行 verify 命令 */
-async function runVerify(verify: string, workdir: string, timeoutMs = 300000): Promise<{ ok: boolean; out: string; code: number }> {
+/** verify 中禁用的 shell 元字符 (按序检测, 多字符序列在前)。 */
+const VERIFY_SHELL_METACHARS = ['&&', '||', '$(', '`', ';', '|', '>', '<', '&'] as const
+
+/** 命中第一个未允许的 shell 元字符, 无则返回 undefined。 */
+function verifyShellMetachar(verify: string): string | undefined {
+  for (const c of VERIFY_SHELL_METACHARS) {
+    if (verify.includes(c)) return c
+  }
+  return undefined
+}
+
+/** 运行 verify 命令 (C2): 默认免 shell (空白分词 execFile, cwd=resolve(workdir));
+ * 含未允许元字符 → 拒绝; env TAIJI_VERIFY_SHELL_OK=1 恢复 bash -c 旧行为。 */
+export async function runVerify(
+  verify: string,
+  workdir: string,
+  timeoutMs = 300000,
+): Promise<{ ok: boolean; out: string; code: number; skipped?: boolean }> {
+  if (process.env.TAIJI_VERIFY_SHELL_OK === '1') {
+    try {
+      const { stdout, stderr } = await execFileAsync('bash', ['-c', verify], {
+        cwd: resolve(workdir),
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+      })
+      return { ok: true, out: stdout + stderr, code: 0 }
+    } catch (e) {
+      const p = execErrProps(e)
+      return { ok: false, out: p.stdout + p.stderr + p.message, code: p.code }
+    }
+  }
+  const meta = verifyShellMetachar(verify)
+  if (meta !== undefined) {
+    return { ok: false, out: `verify 含未允许 shell 元字符: ${meta}`, code: 1, skipped: true }
+  }
+  const tokens = verify.trim().split(/\s+/).filter(Boolean)
+  if (tokens.length === 0) {
+    return { ok: false, out: 'verify 为空', code: 1, skipped: true }
+  }
+  const cmd = tokens[0] ?? ''
+  const restArgs = tokens.slice(1)
   try {
-    const { stdout, stderr } = await execFileAsync('bash', ['-c', verify], {
-      cwd: workdir,
+    const { stdout, stderr } = await execFileAsync(cmd, restArgs, {
+      cwd: resolve(workdir),
       timeout: timeoutMs,
       maxBuffer: 4 * 1024 * 1024,
     })
     return { ok: true, out: stdout + stderr, code: 0 }
   } catch (e) {
     const p = execErrProps(e)
-    return {
-      ok: false,
-      out: p.stdout + p.stderr + p.message,
-      code: p.code,
-    }
+    return { ok: false, out: p.stdout + p.stderr + p.message, code: p.code }
   }
 }
 
-/** 从测试输出提取失败文件 (简化: pytest 路径解析) */
-function failedFilesFromOutput(out: string): string[] {
+/** 从测试输出提取失败文件 (C8): .py / FAIL <path> / error TS#### / <path>:line:col / Go <path>:line:col:;
+ * env TAIJI_FAILED_FILE_RE 覆盖为自定义正则 (取 m[1] ?? m[0])。 */
+export function failedFilesFromOutput(out: string): string[] {
   const files = new Set<string>()
-  const re = /([\w./-]+\.py):\d+/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(out)) !== null) {
-    const f = (m[1] ?? '').replace(/^\.\//, '')
-    if (f.includes('/') || f.includes('\\')) files.add(f)
+  const custom = process.env.TAIJI_FAILED_FILE_RE
+  const patterns: RegExp[] = custom
+    ? [new RegExp(custom, 'g')]
+    : [
+      /([\w./-]+\.py):\d+/g,
+      /\bFAIL\s+([^\s:]+)/g,
+      /\berror\s+TS\d+:\s*([^\s:]+)/g,
+      /([\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|go)):\d+:\d+:?/g,
+    ]
+  for (const re of patterns) {
+    let m: RegExpExecArray | null
+    while ((m = re.exec(out)) !== null) {
+      const f = (m[1] ?? m[0] ?? '').replace(/^\.\//, '')
+      if (f && (f.includes('/') || f.includes('\\'))) files.add(f)
+    }
   }
   return [...files].slice(0, 5)
 }
@@ -334,7 +432,7 @@ export function verifyWithAcceptance(verify: string, acceptPath: string, workdir
   return verify.includes('pytest') ? `${verify} ${rel}` : `pytest -q ${rel} && ${verify}`
 }
 
-async function delegate(
+export async function delegate(
   ctx: Context,
   provider: string,
   label: string,
@@ -342,12 +440,13 @@ async function delegate(
   parent: Agent,
   signal: AbortSignal,
   workdir: string = '.',
+  sandbox: string = 'full',
 ): Promise<{ ok: boolean; out: string }> {
   if (provider === 'claude-code') {
-    return delegateClaudeCli(prompt, workdir, signal)
+    return delegateClaudeCli(prompt, workdir, signal, sandbox)
   }
   if (provider === 'codex') {
-    return delegateCodexCli(prompt, workdir, signal)
+    return delegateCodexCli(prompt, workdir, signal, sandbox)
   }
   const subagents = ctx.get('subagents') as {
     start(
@@ -362,6 +461,8 @@ async function delegate(
     parent,
     signal,
   })
+  // C11: onAbort 提升到外层作用域, finally 里移除监听 (旧实现从不移除)
+  let onAbort: (() => void) | undefined
   try {
     // 有界等待: ACP/子代理通道挂起时秒级失败 (claude/codex CLI 通道已提前返回, 不走此处)
     let result: AcpStream
@@ -371,7 +472,7 @@ async function delegate(
           () => reject(new Error(`ACP delegate timeout ${ACP_DELEGATE_TIMEOUT}ms`)),
           ACP_DELEGATE_TIMEOUT,
         )
-        const onAbort = () => { clearTimeout(t); reject(new Error('aborted')) }
+        onAbort = () => { clearTimeout(t); reject(new Error('aborted')) }
         signal.addEventListener('abort', onAbort, { once: true })
         run.result.then(
           (v) => { clearTimeout(t); resolve(v) },
@@ -389,8 +490,15 @@ async function delegate(
     const stopReason = result.stopReason
     return { ok: !['error', 'canceled'].includes(stopReason ?? ''), out: text }
   } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
     await run.dispose().catch(() => {})
   }
+}
+
+/** claude CLI 权限参数 (C1): full → Edit Write; restrict → 只读 Read (去掉 Edit Write)。 */
+export function claudeCliArgs(prompt: string, workdir: string, sandbox = 'full'): string[] {
+  if (sandbox === 'restrict') return ['-p', prompt, '--allowedTools', 'Read', '--add-dir', workdir]
+  return ['-p', prompt, '--allowedTools', 'Edit Write', '--add-dir', workdir]
 }
 
 /** claude CLI 直调 (绕过 SDK 集成层, 已验证 2026-09-01) */
@@ -398,12 +506,13 @@ async function delegateClaudeCli(
   prompt: string,
   workdir: string,
   signal: AbortSignal,
+  sandbox: string = 'full',
 ): Promise<{ ok: boolean; out: string }> {
   const deepseekKey = process.env.DEEPSEEK_API_KEY ?? ''
   try {
     const { stdout, stderr } = await execFileAsync(
       'claude',
-      ['-p', prompt, '--allowedTools', 'Edit Write', '--add-dir', workdir],
+      claudeCliArgs(prompt, workdir, sandbox),
       {
         cwd: workdir,
         timeout: 480000,
@@ -426,19 +535,31 @@ async function delegateClaudeCli(
   }
 }
 
+/** codex CLI 权限参数 (C1): full → danger-full-access + bypass; restrict → read-only 且不加 bypass。 */
+export function codexCliArgs(prompt: string, lastMsgPath: string, sandbox = 'full'): string[] {
+  if (sandbox === 'restrict') {
+    return ['exec', '-s', 'read-only', '--skip-git-repo-check', '--output-last-message', lastMsgPath, prompt]
+  }
+  return ['exec', '-s', 'danger-full-access',
+    '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
+    '--output-last-message', lastMsgPath, prompt]
+}
+
 /** codex CLI 直调 (2026-09-08 根治: dsh subagent-codex 经 SDK/app-server 桥在本容器返回
  * invalid-result 零输出 — 与 claude SDK 桥同病。codex exec 直调 + danger-full-access
  * (config.toml 已改) 实测可真实执行 shell, 不再依赖 bubblewrap/user namespaces)。 */
-async function delegateCodexCli(
+export async function delegateCodexCli(
   prompt: string,
   workdir: string,
   signal: AbortSignal,
+  sandbox: string = 'full',
 ): Promise<{ ok: boolean; out: string }> {
   const deepseekKey = process.env.DEEPSEEK_API_KEY ?? ''
   // 2026-09-14: codex 对**较长回答**不把 agent message 写进 stdout (实测 ~80+ token 时
   // 只回显 prompt + token 统计 → "首个{到末个}"截到 prompt 里的 JSON 模板 → 解析必失败)。
   // 正解 = --output-last-message 落盘回读 (taiji 技能既有坑 2: 结论须落盘取)。
-  const lastMsgPath = join(tmpdir(), `taiji-codex-last-${Date.now()}.txt`)
+  // C11: 临时文件带 pid + 时间戳, 读完 last 后 finally unlink (不再泄漏)。
+  const lastMsgPath = join(tmpdir(), `taiji-codex-${process.pid}-${Date.now()}.txt`)
   const readLast = (): string => {
     try {
       return existsSync(lastMsgPath) ? readFileSync(lastMsgPath, 'utf8').trim() : ''
@@ -447,9 +568,7 @@ async function delegateCodexCli(
   try {
     const { stdout, stderr } = await execFileAsync(
       'codex',
-      ['exec', '-s', 'danger-full-access',
-        '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check',
-        '--output-last-message', lastMsgPath, prompt],
+      codexCliArgs(prompt, lastMsgPath, sandbox),
       {
         cwd: workdir,
         timeout: 480000,
@@ -466,6 +585,8 @@ async function delegateCodexCli(
       ok: false,
       out: readLast() || p.stdout + p.stderr + p.message,
     }
+  } finally {
+    try { unlinkSync(lastMsgPath) } catch { /* 已不存在, 忽略 */ }
   }
 }
 
@@ -476,7 +597,7 @@ async function delegateCodexCli(
 prompt 回显的 JSON 模板) 必然解析失败。这里扫描所有**括号平衡**的 {…} 片段, 逐个 JSON.parse,
 返回第一个含必需字段的对象; 找不到返回 undefined (调用方按通道级失败处理)。
  */
-function extractJsonObject(text: string, requiredKeys: string[]): Record<string, unknown> | undefined {
+export function extractJsonObject(text: string, requiredKeys: string[]): Record<string, unknown> | undefined {
   const s = text ?? ''
   const candidates: string[] = []
   for (let i = 0; i < s.length; i++) {
@@ -503,7 +624,7 @@ function extractJsonObject(text: string, requiredKeys: string[]): Record<string,
   for (const cand of candidates) {
     try {
       const obj = JSON.parse(cand) as Record<string, unknown>
-      if (obj && typeof obj === 'object' && requiredKeys.some(k => k in obj)) return obj
+      if (obj && typeof obj === 'object' && requiredKeys.every(k => k in obj)) return obj
     } catch { /* 继续尝试下一个候选 */ }
   }
   return undefined
@@ -550,7 +671,7 @@ async function piReview(
 }
 
 /** 单通道复审执行 (STRICT JSON 门) — 返回 ok=false 表示通道级失败 */
-async function runReviewGate(
+export async function runReviewGate(
   ctx: Context,
   workdir: string,
   goal: string,
@@ -644,20 +765,21 @@ async function settleGate(
 
 /** 太极主循环: 信息素 → 测试 → 竞标 → 修复 → 复测 → 评审 → 收敛
  * 4.0 扩展 (2026-09-01): danger_dimensions 评分卡可配置; sandbox 权限分级。 */
-async function taijiRun(
+async function taijiRunInner(
   ctx: Context,
   args: TaijiArgs,
   parent: Agent,
   signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const workdir = resolve(args.workdir)
+  const warn: WarnFn = message => ctx.logger.warn(message)
   let verify = args.verify || 'pytest -q'
   const maxRounds = args.rounds ?? MAX_ROUNDS_DEFAULT
   const goal = args.goal
   const dims = args.danger_dimensions
   const sandbox = args.sandbox ?? 'full'   // full=默认 / restrict=只读验证
 
-  let pm = loadPheromones(workdir)
+  let pm = loadPheromones(workdir, warn)
   const rounds: Record<number, string> = {}
   let prevPassed = false
   let converged = false
@@ -691,7 +813,7 @@ async function taijiRun(
 
   for (let gen = 1; gen <= maxRounds; gen++) {
     signal.throwIfAborted()
-    pm = evaporate(loadPheromones(workdir), prevPassed)
+    pm = evaporate(loadPheromones(workdir, warn), prevPassed)
 
     // 测试
     const t = await runVerify(verify, workdir)
@@ -706,84 +828,89 @@ async function taijiRun(
 
     // 竞标 → 修复 (按排序逐个尝试, 复测绿即停, 通道失败自动降级)
     if (!t.ok) {
-      const target = auction(pm, workdir)
-      if (target) {
-        const note = pm[target.file]?.Pr_note
-        const ctxNote = note ? `\n评审提示: ${note}` : ''
-        const taskDesc = `${target.file === '__project__' ? '项目整体' : target.file}`
-        let fixed = false
-        let t2: { ok: boolean; out: string; code: number } | undefined
-        for (const agent of target.agents) {
-          const provider = PROVIDER_BY_AGENT[agent]
-          if (!provider) {
-            rounds[gen] += ` | 无 provider: ${agent}`
-            continue
-          }
-          const r = await delegate(
-            ctx,
-            provider,
-            `太极${agent}修复`,
-            `修复 ${taskDesc} 使验收命令 \`${verify}\` 通过。
+      if (sandbox === 'restrict') {
+        // C1: restrict 只读 → 跳过修复循环 (不进入 delegate 写通道)
+        rounds[gen] += ' | sandbox=restrict: 跳过修复(只读)'
+        stats.sandbox_enforced = true
+      } else {
+        const target = auction(pm, workdir, gen, warn)
+        if (target) {
+          const note = pm[target.file]?.Pr_note
+          const ctxNote = note ? `\n评审提示: ${note}` : ''
+          const taskDesc = `${target.file === '__project__' ? '项目整体' : target.file}`
+          let fixed = false
+          let t2: { ok: boolean; out: string; code: number } | undefined
+          for (const agent of target.agents) {
+            const provider = PROVIDER_BY_AGENT[agent]
+            if (!provider) {
+              rounds[gen] += ` | 无 provider: ${agent}`
+              continue
+            }
+            const r = await delegate(
+              ctx,
+              provider,
+              `太极${agent}修复`,
+              `修复 ${taskDesc} 使验收命令 \`${verify}\` 通过。
 任务: ${goal.slice(0, 400)}
 ${ctxNote}
 测试失败详情:
 ${t.out.slice(-1500)}
 
 输出要求: 实际编辑文件完成修复。完成后报告改了什么。`,
-            parent,
-            signal,
-            workdir,
-          )
-          rounds[gen] += ` | ${agent}修复 ${r.ok ? 'ok' : `失败: ${r.out.slice(0, 120)}`}`
-          // 4.0 信誉权重: 修复成败回写 (连续失败 → 该通道竞标分下降, 其它通道上位)
-          updateAgentWeight(workdir, agent, r.ok)
-          // 修复后复测
-          t2 = await runVerify(verify, workdir)
-          rounds[gen] += ` | ${agent}复测 ${t2.ok ? '绿 ✓' : '仍红'}`
-          if (t2.ok) {
-            fixed = true
-            prevPassed = true
-            break
+              parent,
+              signal,
+              workdir,
+              sandbox,
+            )
+            rounds[gen] += ` | ${agent}修复 ${r.ok ? 'ok' : `失败: ${r.out.slice(0, 120)}`}`
+            // 修复后复测 (C3: 权重信号移至复测之后, 以复测结果为准; 委派失败不双计)
+            t2 = await runVerify(verify, workdir)
+            rounds[gen] += ` | ${agent}复测 ${t2.ok ? '绿 ✓' : '仍红'}`
+            updateAgentWeight(workdir, agent, agentWeightDelta(r.ok, t2), warn)
+            if (t2.ok) {
+              fixed = true
+              prevPassed = true
+              break
+            }
+            prevPassed = false
+            signal.throwIfAborted()
           }
-          prevPassed = false
-          signal.throwIfAborted()
-        }
-        if (t2 === undefined) {
-          rounds[gen] += ' | 所有通道均不可用'
-          pm = sprayWeighted(pm, failedFilesFromOutput(t.out))
-          savePheromones(workdir, pm)
-        } else if (!fixed) {
-          pm = sprayWeighted(pm, failedFilesFromOutput(t2.out))
-          savePheromones(workdir, pm)
-        } else {
-          // 修复生效 → 评审: pi 侦察 (维度可配置) + 复审门 (codex→降级链)
-          const review = await runPiReview()
-          const piFail = isChannelFail(review.suggestions)
-          rounds[gen] += ` | pi danger=${piFail ? 'N/A(通道失败)' : review.danger}`
-          if (review.danger < DANGER_THRESHOLD || piFail) {
-            const g = await settleGate(ctx, workdir, goal, parent, signal)
-            rounds[gen] += g.log
-            stats.review = { degraded: g.degraded, channel: g.channel }
-            if (g.converged) {
-              converged = true
-              finalState = `第 ${gen} 代收敛: 测试绿 + danger=${piFail ? 'N/A(pi通道失败)' : review.danger} + ${g.channel === 'codex' ? '复审' : `复审降级(${g.channel})`} PASS`
-              break
-            }
-            if (g.stop) {
-              finalState = g.finalState
-              break
-            }
-            // 真实 FAIL (任意可用通道) → 回灌信息素
-            pm = { ...pm, __project__: { Pe: 30, Pr: 20, complexity: 30, Pr_note: `[复审FAIL] ${g.summary.slice(0, 300)}` } }
+          if (t2 === undefined) {
+            // C10: 全通道不可用 → 只记日志, 不再二次 sprayWeighted (首轮测试红已喷洒)
+            rounds[gen] += ' | 所有通道均不可用'
+          } else if (!fixed) {
+            pm = sprayWeighted(pm, failedFilesFromOutput(t2.out))
             savePheromones(workdir, pm)
           } else {
-            // danger 过高 (pi 通道正常) → 喷洒评审意见
-            pm = { ...pm, __project__: { Pe: 0, Pr: 20, complexity: 30, Pr_note: review.suggestions.slice(0, 300) } }
-            savePheromones(workdir, pm)
+            // 修复生效 → 评审: pi 侦察 (维度可配置) + 复审门 (codex→降级链)
+            const review = await runPiReview()
+            const piFail = isChannelFail(review.suggestions)
+            rounds[gen] += ` | pi danger=${piFail ? 'N/A(通道失败)' : review.danger}`
+            if (review.danger < DANGER_THRESHOLD || piFail) {
+              const g = await settleGate(ctx, workdir, goal, parent, signal)
+              rounds[gen] += g.log
+              stats.review = { degraded: g.degraded, channel: g.channel }
+              if (g.converged) {
+                converged = true
+                finalState = `第 ${gen} 代收敛: 测试绿 + danger=${piFail ? 'N/A(pi通道失败)' : review.danger} + ${g.channel === 'codex' ? '复审' : `复审降级(${g.channel})`} PASS`
+                break
+              }
+              if (g.stop) {
+                finalState = g.finalState
+                break
+              }
+              // 真实 FAIL (任意可用通道) → 回灌信息素
+              pm = { ...pm, __project__: { Pe: 30, Pr: 20, complexity: 30, Pr_note: `[复审FAIL] ${g.summary.slice(0, 300)}` } }
+              savePheromones(workdir, pm)
+            } else {
+              // danger 过高 (pi 通道正常) → 喷洒评审意见
+              pm = { ...pm, __project__: { Pe: 0, Pr: 20, complexity: 30, Pr_note: review.suggestions.slice(0, 300) } }
+              savePheromones(workdir, pm)
+            }
           }
+        } else {
+          rounds[gen] += ' | 无候选 (信息素为空)'
         }
-      } else {
-        rounds[gen] += ' | 无候选 (信息素为空)'
       }
     } else {
       prevPassed = true
@@ -842,6 +969,24 @@ ${t.out.slice(-1500)}
     roundsUsed: Object.keys(rounds).length,
     stats,
   }
+}
+
+/** 同目录并发互斥锁 (C9): 每个 workdir 一条 promise 链, 串行化 taijiRunInner。 */
+const taijiLocks = new Map<string, Promise<unknown>>()
+
+/** 太极主循环入口 (C9): 整个主循环体包进 per-workdir promise 链, 锁本身不进 stats。 */
+export async function taijiRun(
+  ctx: Context,
+  args: TaijiArgs,
+  parent: Agent,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const workdir = resolve(args.workdir)
+  const run = (): Promise<Record<string, unknown>> => taijiRunInner(ctx, args, parent, signal)
+  const prev = taijiLocks.get(workdir) ?? Promise.resolve()
+  const cur = prev.then(run, run)
+  taijiLocks.set(workdir, cur.finally(() => {}))
+  return cur
 }
 
 export function apply(ctx: Context): void {
@@ -911,6 +1056,7 @@ export function apply(ctx: Context): void {
       roundsUsed: number
       rounds: JsonValue
       pheromonePath: string
+      stats: JsonValue
     }> {
       const parent = exec.agent
       if (!parent) {
@@ -923,6 +1069,7 @@ export function apply(ctx: Context): void {
         roundsUsed: Number(r.roundsUsed ?? 0),
         rounds: (r.rounds ?? {}) as JsonValue,
         pheromonePath: String(r.pheromonePath ?? ''),
+        stats: (r.stats ?? {}) as JsonValue,
       }
     },
   }))

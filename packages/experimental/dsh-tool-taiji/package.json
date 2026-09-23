@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tool-taiji",
   "description": "太极调度工具: 信息素/竞标/评审/收敛循环 → dsh 工具 (方案 A)",
-  "version": "0.1.2-alpha.2",
+  "version": "0.2.0",
   "private": true,
   "repository": {
     "type": "git",
