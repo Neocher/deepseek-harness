@@ -27,6 +27,7 @@ import {
   resolveConvergence,
   resolvePrNote,
   setProjectNote,
+  buildEvidence,
 } from '../src/index.js'
 
 let td: string
@@ -499,5 +500,65 @@ describe('P1-C 机械判官层', () => {
     const rc = resolveConvergence({ converged: true, channel: 'codex' }, true, 2, 40)
     expect(rc.converged).toBe(true)
     expect(rc.finalState).toContain('PASS')
+  })
+})
+
+/** P1-D: 收敛证据链 */
+describe('P1-D 收敛证据链', () => {
+  const input = {
+    diffFiles: ['a.py', 'src/b.ts'],
+    verifyBefore: 'baseline fail output',
+    verifyAfter: 'converged pass output',
+    gates: [
+      { name: 'gate-zero-change', ok: true, detail: '变更文件 2 个' },
+      { name: 'gate-scope', ok: true, detail: '变更与失败文件相交' },
+    ],
+    reviewChannel: 'codex',
+    piFail: false,
+    converged: true,
+  }
+
+  it('buildEvidence 确定性: 同 input 两次 → deep-equal 且 JSON 完全一致 (可重放判据)', () => {
+    const a = buildEvidence(input)
+    const b = buildEvidence(input)
+    expect(a).toEqual(b)
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b))
+  })
+
+  it('reviewConfidence 三档确定性规则', () => {
+    expect(buildEvidence({ ...input, reviewChannel: 'codex', piFail: false }).reviewConfidence).toBe(1.0)
+    expect(buildEvidence({ ...input, reviewChannel: 'opencode', piFail: true }).reviewConfidence).toBe(0.3)
+    expect(buildEvidence({ ...input, reviewChannel: 'claude-code', piFail: false }).reviewConfidence).toBe(0.5)
+  })
+
+  it('证据含全字段: diffFiles/gates/verifyBefore/verifyAfter/reviewChannel/piFail/converged 透传', () => {
+    const e = buildEvidence(input)
+    expect(e.diffFiles).toEqual(input.diffFiles)
+    expect(e.gates).toEqual(input.gates)
+    expect(e.verifyBefore).toBe(input.verifyBefore)
+    expect(e.verifyAfter).toBe(input.verifyAfter)
+    expect(e.reviewChannel).toBe(input.reviewChannel)
+    expect(e.piFail).toBe(input.piFail)
+    expect(e.converged).toBe(input.converged)
+  })
+
+  it('截断: verifyBefore/verifyAfter 超过 2000 → 截到 2000', () => {
+    const long = 'x'.repeat(2500)
+    const e = buildEvidence({ ...input, verifyBefore: long, verifyAfter: long })
+    expect(e.verifyBefore).toHaveLength(2000)
+    expect(e.verifyAfter).toHaveLength(2000)
+    expect(e.verifyBefore).toBe('x'.repeat(2000))
+  })
+
+  it('接线语义 (结构断言): 收敛证据收集 + 落盘 + 返回值顶层接线', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('export function buildEvidence(')
+    expect(src).toContain('if (converged) {')
+    expect(src).toContain('evidence = buildEvidence({')
+    expect(src).toContain('lastBaselineOut = t.out')
+    expect(src).toContain('lastConvergedOut = t2.out')
+    expect(src).toContain('lastGates = gates')
+    expect(src).toContain('evidence: evidence ?? null')
+    expect(src).toContain('r.evidence ?? null')
   })
 })

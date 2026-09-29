@@ -943,6 +943,51 @@ export function resolveConvergence(
   }
 }
 
+/** 收敛证据链 (P1-D): 运行期逐项收集, 供调用方程序化核验"凭什么收敛"。
+ * 纯函数 (无 ctx / 无 LLM / 无 IO): 只搬运运行期变量 + 派生确定性 reviewConfidence。 */
+export interface ConvergenceEvidence {
+  diffFiles: string[]
+  verifyBefore: string
+  verifyAfter: string
+  gates: GateResult[]
+  reviewChannel: string
+  piFail: boolean
+  reviewConfidence: number
+  converged: boolean
+}
+
+/** verify 输出截断上限 (P1-D): 集中定义, 为 P2 外置留口。 */
+const EVIDENCE_VERIFY_LIMIT = 2000
+
+/** 构建收敛证据 (P1-D): 确定性纯函数, 同 input 两次调用输出完全一致 (可重放判据)。
+ * reviewConfidence 三档规则 (非 LLM 打分):
+ *   - channel==='codex' && !piFail → 1.0
+ *   - piFail && channel!=='codex' → 0.3 (fail-closed 情形)
+ *   - 其他降级 (channel!=='codex' && !piFail, 含 codex+piFail) → 0.5
+ * verifyBefore/verifyAfter 超过 EVIDENCE_VERIFY_LIMIT 截断到 2000。 */
+export function buildEvidence(input: {
+  diffFiles: string[]
+  verifyBefore: string
+  verifyAfter: string
+  gates: GateResult[]
+  reviewChannel: string
+  piFail: boolean
+  converged: boolean
+}): ConvergenceEvidence {
+  const { diffFiles, verifyBefore, verifyAfter, gates, reviewChannel, piFail, converged } = input
+  const reviewConfidence = reviewChannel === 'codex' && !piFail
+    ? 1.0
+    : piFail && reviewChannel !== 'codex'
+      ? 0.3
+      : 0.5
+  return {
+    diffFiles,
+    verifyBefore: verifyBefore.slice(0, EVIDENCE_VERIFY_LIMIT),
+    verifyAfter: verifyAfter.slice(0, EVIDENCE_VERIFY_LIMIT),
+    gates, reviewChannel, piFail, reviewConfidence, converged,
+  }
+}
+
 /** 复审门收尾统一语义 (2026-09-08 修复通道熔断)
  * 返回: log=rounds 记录串 / converged=真收敛 / stop=提前止损(全通道不可用) / finalState */
 async function settleGate(
@@ -1001,6 +1046,12 @@ async function taijiRunInner(
   const stats: Record<string, unknown> = { sandbox, dims: dims ?? 'default' }
   let piBroken = false   // pi 通道失败一次后本轮跳过 (不再每代付 2min 超时)
 
+  // P1-D: 收敛证据链"最新一代"快照 (循环外声明, 同 mechanicalGateBlock; 运行期逐代更新)
+  let lastBaselineOut: string | undefined
+  let lastConvergedOut: string | undefined
+  let lastGates: GateResult[] | undefined
+  let evidence: ConvergenceEvidence | undefined
+
   const runPiReview = async (): Promise<{ danger: number; suggestions: string; files: string[] }> => {
     if (piBroken) return { danger: 100, suggestions: `${PI_CHANNEL_FAIL_PREFIX} pi 本轮跳过(此前通道失败)`, files: [] }
     const rv = await piReview(ctx, workdir, parent, signal, dims)
@@ -1032,6 +1083,7 @@ async function taijiRunInner(
 
     // 测试
     const t = await runVerify(verify, workdir)
+    lastBaselineOut = t.out
     if (!t.ok) {
       const failed = failedFilesFromOutput(t.out)
       pm = sprayWeighted(pm, failed)
@@ -1080,6 +1132,7 @@ ${t.out.slice(-1500)}
             rounds[gen] += ` | ${agent}修复 ${r.ok ? 'ok' : `失败: ${r.out.slice(0, 120)}`}`
             // 修复后复测 (C3: 权重信号移至复测之后, 以复测结果为准; 委派失败不双计)
             t2 = await runVerify(verify, workdir)
+            lastConvergedOut = t2.out
             rounds[gen] += ` | ${agent}复测 ${t2.ok ? '绿 ✓' : '仍红'}`
             // P0-⑥: 零变更门 — 三条件齐才计权重 (git 有变更 + 与失败文件相交 + t2.ok)
             const changedFiles = await getChangedFiles(workdir)
@@ -1099,6 +1152,7 @@ ${t.out.slice(-1500)}
               tsconfigAvailable: existsSync(join(workdir, 'tsconfig.json')),
             })
             stats.gates = gates
+            lastGates = gates
             const hardFail = gates.filter(g => !g.ok && !g.detail.includes('warn-level'))
             if (hardFail.length > 0 && t2.ok) {
               rounds[gen] += ` | 机械门FAIL: ${hardFail.map(g => g.name).join(',')}`
@@ -1131,6 +1185,17 @@ ${t.out.slice(-1500)}
                 const rc = resolveConvergence(g, piFail, gen, review.danger, mechanicalGateBlock)
                 converged = rc.converged
                 finalState = rc.finalState
+                if (converged) {
+                  evidence = buildEvidence({
+                    diffFiles: await getChangedFiles(workdir),
+                    verifyBefore: lastBaselineOut ?? '',
+                    verifyAfter: lastConvergedOut ?? '',
+                    gates: lastGates ?? [],
+                    reviewChannel: g.channel,
+                    piFail,
+                    converged: true,
+                  })
+                }
                 break
               }
               if (g.stop) {
@@ -1164,6 +1229,17 @@ ${t.out.slice(-1500)}
           const rc = resolveConvergence(g, piFail, gen, review.danger, mechanicalGateBlock)
           converged = rc.converged
           finalState = rc.finalState
+          if (converged) {
+            evidence = buildEvidence({
+              diffFiles: await getChangedFiles(workdir),
+              verifyBefore: lastBaselineOut ?? '',
+              verifyAfter: lastConvergedOut ?? '',
+              gates: lastGates ?? [],
+              reviewChannel: g.channel,
+              piFail,
+              converged: true,
+            })
+          }
           break
         }
         if (g.stop) {
@@ -1195,6 +1271,7 @@ ${t.out.slice(-1500)}
         ts: Date.now(), goal, workdir, verify, sandbox, dims: dims ?? 'default',
         converged, finalState, roundsUsed: Object.keys(rounds).length,
         rounds, review: stats.review ?? null,
+        evidence: evidence ?? null,
       }, null, 2),
       'utf-8',
     )
@@ -1207,6 +1284,7 @@ ${t.out.slice(-1500)}
     pheromonePath: pheromonePath(workdir),
     roundsUsed: Object.keys(rounds).length,
     stats,
+    evidence: evidence ?? null,
   }
 }
 
@@ -1279,6 +1357,7 @@ export function apply(ctx: Context): void {
           rounds: { type: 'json', required: true },
           pheromonePath: { type: 'string', required: true },
           stats: { type: 'json' },
+          evidence: { type: 'json' },
         },
       },
       render: (_args, value) => [{
@@ -1296,6 +1375,7 @@ export function apply(ctx: Context): void {
       rounds: JsonValue
       pheromonePath: string
       stats: JsonValue
+      evidence: JsonValue
     }> {
       const parent = exec.agent
       if (!parent) {
@@ -1309,6 +1389,7 @@ export function apply(ctx: Context): void {
         rounds: (r.rounds ?? {}) as JsonValue,
         pheromonePath: String(r.pheromonePath ?? ''),
         stats: (r.stats ?? {}) as JsonValue,
+        evidence: (r.evidence ?? null) as JsonValue,
       }
     },
   }))
