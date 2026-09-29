@@ -43,8 +43,15 @@ const PROVIDER_BY_AGENT: Record<string, string> = {
   codex: 'codex',
 }
 
-const DANGER_THRESHOLD = 40
-const MAX_ROUNDS_DEFAULT = 4
+// ── P1-⑤: 决策参数集中区 (env 覆盖 + 默认值即现值; 来源可考、校准未证) ──
+const DANGER_THRESHOLD = Number(process.env.TAIJI_DANGER_THRESHOLD ?? 40)
+const MAX_ROUNDS_DEFAULT = Number(process.env.TAIJI_MAX_ROUNDS ?? 4)
+const WEIGHT_DECAY = Number(process.env.TAIJI_WEIGHT_DECAY ?? 0.9)
+const SPRAY_FILE_PE = Number(process.env.TAIJI_SPRAY_FILE_PE ?? 30)
+const SPRAY_GLOBAL_PE = Number(process.env.TAIJI_SPRAY_GLOBAL_PE ?? 20)
+const PEVAPOR_GREEN_FACTOR = Number(process.env.TAIJI_PEVAPOR_GREEN ?? 0.5)
+const PEVAPOR_GEN_FACTOR = Number(process.env.TAIJI_PEVAPOR_GEN ?? 0.8)
+const STIMULUS_PR_FACTOR = Number(process.env.TAIJI_STIMULUS_PR_FACTOR ?? 0.5)
 
 /** 评审通道降级链 (2026-09-08 修复: codex 沙箱在本容器不可用 → 通道失败不再当真实 FAIL)
  * codex → opencode → claude-code (CLI 直调, 已知可用)。env TAIJI_REVIEW_CHAIN 可覆盖。 */
@@ -56,6 +63,41 @@ const CHANNEL_ALL_FAIL = '(复审通道全不可用)'
 /** ACP/子代理委派有界超时 (2026-09-08: pi-acp 桥实测挂起 ~10min 无声失败 —
  * 通道坏时应秒级失败进入降级/门, 不许烧每代 10 分钟)。env TAIJI_DELEGATE_TIMEOUT 可覆盖。 */
 const ACP_DELEGATE_TIMEOUT = Number(process.env.TAIJI_DELEGATE_TIMEOUT ?? 120_000)
+
+/** 本次运行生效参数快照 (P1-⑤): 8 决策常量 + 委派超时/复审链/autoTdd + 可选生态。 */
+export interface EffectiveParams {
+  dangerThreshold: number
+  maxRounds: number
+  weightDecay: number
+  sprayFilePe: number
+  sprayGlobalPe: number
+  peVaporGreen: number
+  peVaporGen: number
+  stimulusPrFactor: number
+  delegateTimeoutMs: number
+  reviewChain: string
+  autoTdd: boolean
+  ecosystem?: string
+}
+
+/** 生效参数快照 (P1-⑤) — 运行时读 env (不复用加载期常量, 保证可单测)。
+ * 无 env 时返回全部现值; ecosystem 可选、不填充 (生态由 stats.ecosystem 记录)。
+ * @returns env 覆盖后的生效参数 (8 决策常量 + 委派超时/复审链/autoTdd) */
+export function effectiveParams(): EffectiveParams {
+  return {
+    dangerThreshold: Number(process.env.TAIJI_DANGER_THRESHOLD ?? 40),
+    maxRounds: Number(process.env.TAIJI_MAX_ROUNDS ?? 4),
+    weightDecay: Number(process.env.TAIJI_WEIGHT_DECAY ?? 0.9),
+    sprayFilePe: Number(process.env.TAIJI_SPRAY_FILE_PE ?? 30),
+    sprayGlobalPe: Number(process.env.TAIJI_SPRAY_GLOBAL_PE ?? 20),
+    peVaporGreen: Number(process.env.TAIJI_PEVAPOR_GREEN ?? 0.5),
+    peVaporGen: Number(process.env.TAIJI_PEVAPOR_GEN ?? 0.8),
+    stimulusPrFactor: Number(process.env.TAIJI_STIMULUS_PR_FACTOR ?? 0.5),
+    delegateTimeoutMs: Number(process.env.TAIJI_DELEGATE_TIMEOUT ?? 120_000),
+    reviewChain: process.env.TAIJI_REVIEW_CHAIN ?? REVIEW_CHAIN_DEFAULT,
+    autoTdd: process.env.TAIJI_AUTO_TDD !== '0',
+  }
+}
 
 /** 通道失败统一判定: pi 用"评审"措辞, 复审门用"复审"措辞 — 两者都是通道级失败标记 */
 function isChannelFail(text: string): boolean {
@@ -141,29 +183,54 @@ export function savePheromones(workdir: string, pm: PheromoneMap): void {
   atomicWriteJson(pheromonePath(workdir), pm)
 }
 
-/** Pe 蒸发: 测试绿 → ×0.5 强遗忘; 测试红 → 不蒸发 */
+/** 信息素终态分布 (P1-⑤): Pe 的 files/maxPe/minPe/meanPe 四个统计量。 */
+export interface PheromoneDistribution {
+  files: number
+  maxPe: number
+  minPe: number
+  meanPe: number
+}
+
+/** 信息素终态分布统计 (纯函数): 空 map 返回全 0 (无 NaN/Infinity)。
+ * @param pm 信息素地图
+ * @returns {files, maxPe, minPe, meanPe} */
+export function pheromoneDistribution(pm: PheromoneMap): PheromoneDistribution {
+  const pe = Object.values(pm)
+    .map(n => n.Pe)
+    .filter((x): x is number => typeof x === 'number')
+  if (pe.length === 0) return { files: 0, maxPe: 0, minPe: 0, meanPe: 0 }
+  const sum = pe.reduce((a, b) => a + b, 0)
+  return {
+    files: pe.length,
+    maxPe: Math.max(...pe),
+    minPe: Math.min(...pe),
+    meanPe: sum / pe.length,
+  }
+}
+
+/** Pe 蒸发: 测试绿 → ×PEVAPOR_GREEN_FACTOR 强遗忘; 测试红 → 不蒸发 */
 function evaporate(pm: PheromoneMap, testsPassed: boolean): PheromoneMap {
   const out: PheromoneMap = {}
   for (const [file, node] of Object.entries(pm)) {
     out[file] = {
       ...node,
-      Pe: testsPassed ? Math.round(node.Pe * 0.5) : node.Pe,
-      // Pr 复合蒸发: 代际 ×0.8
-      Pr: Math.round(node.Pr * 0.8),
+      Pe: testsPassed ? Math.round(node.Pe * PEVAPOR_GREEN_FACTOR) : node.Pe,
+      // Pr 复合蒸发: 代际 ×PEVAPOR_GEN_FACTOR
+      Pr: Math.round(node.Pr * PEVAPOR_GEN_FACTOR),
     }
   }
   return out
 }
 
-/** 加权喷洒: 测试失败文件 Pe += 30, 全局 +20 */
+/** 加权喷洒: 测试失败文件 Pe += SPRAY_FILE_PE, 全局 +SPRAY_GLOBAL_PE */
 function sprayWeighted(pm: PheromoneMap, failedFiles: string[]): PheromoneMap {
   const out = { ...pm }
   const global = out['__project__'] ?? { Pe: 0, Pr: 0, complexity: 30 }
-  global.Pe += 20
+  global.Pe += SPRAY_GLOBAL_PE
   out['__project__'] = global
   for (const f of failedFiles) {
     const node = out[f] ?? { Pe: 0, Pr: 0, complexity: 0 }
-    node.Pe += 30
+    node.Pe += SPRAY_FILE_PE
     out[f] = node
   }
   return out
@@ -223,10 +290,9 @@ export function auction(
 }
 
 /** ── 4.0 演进: agent 信誉权重 (2026-09-01) ────────────────────────────
- * 持久化 .taiji/agent-weights.json: 修复成功 +1 / 失败 -1 (衰减0.9)。
+ * 持久化 .taiji/agent-weights.json: 修复成功 +1 / 失败 -1 (衰减 WEIGHT_DECAY)。
  * 竞标分 × (1 + w*0.2): 连续失败的 agent 信誉下降, 其它通道自动上位。 */
 const AGENT_WEIGHTS_FILE = '.taiji/agent-weights.json'
-const WEIGHT_DECAY = 0.9
 
 export function loadAgentWeights(workdir: string, warn: WarnFn = console.warn): Record<string, number> {
   const p = resolve(workdir, AGENT_WEIGHTS_FILE)
@@ -266,7 +332,7 @@ export function updateAgentWeight(workdir: string, agent: string, delta: number,
   saveAgentWeights(workdir, w)
 }
 function stimulusOf(node: PheromoneNode): number {
-  return node.Pe + node.Pr * 0.5
+  return node.Pe + node.Pr * STIMULUS_PR_FACTOR
 }
 
 /** verify 中禁用的 shell 元字符 (按序检测, 多字符序列在前)。 */
@@ -1365,6 +1431,10 @@ ${t.out.slice(-1500)}
     }
   }
 
+  // P1-⑤: 循环结束 (runs 落盘前) 记录信息素终态分布 + agent 权重终态
+  stats.distribution = pheromoneDistribution(loadPheromones(workdir, warn))
+  stats.weights = loadAgentWeights(workdir, warn)
+
   // 运行日志落盘 (2026-09-08 可观测性: rounds/复审通道不再只在返回值一行渲染里, 事后可还原)
   try {
     const runsDir = join(workdir, '.taiji', 'runs')
@@ -1376,6 +1446,7 @@ ${t.out.slice(-1500)}
         ts: Date.now(), goal, workdir, verify, sandbox, dims: dims ?? 'default',
         converged, finalState, roundsUsed: Object.keys(rounds).length,
         rounds, review: stats.review ?? null,
+        params: effectiveParams(),
         evidence: evidence ?? null,
       }, null, 2),
       'utf-8',

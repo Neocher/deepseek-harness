@@ -33,6 +33,8 @@ import {
   tsAcceptanceBody,
   genAcceptanceTest,
   verifyWithAcceptance,
+  effectiveParams,
+  pheromoneDistribution,
 } from '../src/index.js'
 
 let td: string
@@ -45,6 +47,9 @@ afterEach(() => {
   delete process.env.TAIJI_RANDOM_BID
   delete process.env.TAIJI_FAILED_FILE_RE
   delete process.env.TAIJI_TSC_BIN
+  delete process.env.TAIJI_DANGER_THRESHOLD
+  delete process.env.TAIJI_SPRAY_FILE_PE
+  delete process.env.TAIJI_AUTO_TDD
 })
 
 /** C1: sandbox 分级 */
@@ -752,5 +757,60 @@ describe('P1-① auction excludeFiles 多目标选择', () => {
     expect(src).toContain("const taskDesc = `${activeFile === '__project__'")
     // failedFilesFromOutput 仍读 baseline t.out (P0-⑥ 零变更门锚点不变)
     expect(src).toContain('const failedFiles = failedFilesFromOutput(t.out)')
+  })
+})
+
+/** P1-⑤: 参数暴露 + 分布日志 */
+describe('P1-⑤ 参数暴露 + 分布日志', () => {
+  it('effectiveParams 默认值快照: 8 决策常量 + reviewChain/delegateTimeout/autoTdd (AC-2)', () => {
+    const p = effectiveParams()
+    expect(p.dangerThreshold).toBe(40)
+    expect(p.maxRounds).toBe(4)
+    expect(p.weightDecay).toBe(0.9)
+    expect(p.sprayFilePe).toBe(30)
+    expect(p.sprayGlobalPe).toBe(20)
+    expect(p.peVaporGreen).toBe(0.5)
+    expect(p.peVaporGen).toBe(0.8)
+    expect(p.stimulusPrFactor).toBe(0.5)
+    expect(p.reviewChain).toBe('codex,opencode,claude-code')
+    expect(p.delegateTimeoutMs).toBe(120000)
+    expect(p.autoTdd).toBe(true)
+  })
+
+  it('env 覆盖生效: TAIJI_DANGER_THRESHOLD/SPRAY_FILE_PE/AUTO_TDD → effectiveParams 读运行时 env (AC-2)', () => {
+    process.env.TAIJI_DANGER_THRESHOLD = '55'
+    process.env.TAIJI_SPRAY_FILE_PE = '77'
+    process.env.TAIJI_AUTO_TDD = '0'
+    const p = effectiveParams()
+    expect(p.dangerThreshold).toBe(55)
+    expect(p.sprayFilePe).toBe(77)
+    expect(p.autoTdd).toBe(false)
+  })
+
+  it('pheromoneDistribution 正常: {Pe:30},{Pe:10} → files/maxPe/minPe/meanPe (AC-3)', () => {
+    const d = pheromoneDistribution({
+      a: { Pe: 30, Pr: 0, complexity: 0 },
+      b: { Pe: 10, Pr: 0, complexity: 0 },
+    })
+    expect(d).toEqual({ files: 2, maxPe: 30, minPe: 10, meanPe: 20 })
+  })
+
+  it('pheromoneDistribution 空 map → 全 0 (无 NaN/Infinity) (AC-3)', () => {
+    expect(pheromoneDistribution({})).toEqual({ files: 0, maxPe: 0, minPe: 0, meanPe: 0 })
+  })
+
+  it('接线 (结构断言): 8 常量字面量消失 + runs 落盘 params + stats.distribution/weights (AC-1/AC-4)', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('export function effectiveParams()')
+    expect(src).toContain('export function pheromoneDistribution(')
+    expect(src).toContain('params: effectiveParams()')
+    expect(src).toContain('stats.distribution = pheromoneDistribution(loadPheromones(workdir, warn))')
+    expect(src).toContain('stats.weights = loadAgentWeights(workdir, warn)')
+    // 8 常量决策点字面量已从 src 消失 (complexity: 30 / setProjectNote base 除外)
+    expect(src).not.toContain('node.Pe += 30')
+    expect(src).not.toContain('global.Pe += 20')
+    expect(src).not.toContain('node.Pe * 0.5')
+    expect(src).not.toContain('node.Pr * 0.8')
+    expect(src).not.toContain('node.Pr * 0.5')
   })
 })
