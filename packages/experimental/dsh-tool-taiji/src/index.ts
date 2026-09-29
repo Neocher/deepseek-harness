@@ -338,6 +338,27 @@ export function failedFilesFromOutput(out: string): string[] {
   return [...files].slice(0, 5)
 }
 
+/** 获取 workdir 下 `git status --porcelain` 的变更文件 (modified + untracked),
+ * 去前 3 字符状态前缀后返回文件路径; 非 git 仓库或执行异常返回 []。 */
+export async function getChangedFiles(workdir: string): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync('git', ['status', '--porcelain'], {
+      cwd: resolve(workdir), timeout: 10_000, maxBuffer: 1024 * 1024,
+    })
+    return stdout.split('\n').map(l => l.slice(3).trim()).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+/** 零变更门相交判定: 变更文件集与失败文件集是否存在任一双向 substring 命中。
+ * 空 changed → false (无变更不计权重); 空 failed → 降级为只看 changed 非空。 */
+export function hasRelevantChange(changedFiles: string[], failedFiles: string[]): boolean {
+  if (changedFiles.length === 0) return false
+  if (failedFiles.length === 0) return true
+  return changedFiles.some(cf => failedFiles.some(ff => cf.includes(ff) || ff.includes(cf)))
+}
+
 /** 通过 subagents 调度一个子智能体, 返回其输出文本
  * claude-code 走 CLI 直调 (SDK 经 opencodex 桥返回 invalid-result, 2026-09-01 实测;
  * CLI 直调 --allowedTools Edit Write --add-dir 已验证可写目标目录)。 */
@@ -730,6 +751,33 @@ async function codexReviewGate(
   return { passed: false, summary: CHANNEL_ALL_FAIL, channel: 'none', degraded: true, attempts }
 }
 
+/** pi 通道失败 + 复审降级 (channel !== 'codex') → fail-closed: 不得标收敛。 */
+export function isFailClosed(piFail: boolean, channel: string): boolean {
+  return piFail && channel !== 'codex'
+}
+
+/** 收敛决策 (P0-⑥): 把 `if (g.converged)` 后的分支收拢为纯决策, 使 fail-closed 行为可单测。
+ * fail-closed (pi 通道失败 + 复审降级) → 不收敛 + 含 "fail-closed" 文案 (调用方保守终止循环);
+ * 否则 → 收敛 + PASS 文案。gate.converged 为 false 时返回空文案 (调用方不进此分支)。 */
+export function resolveConvergence(
+  gate: { converged: boolean; channel: string },
+  piFail: boolean,
+  gen: number,
+  danger: number,
+): { converged: boolean; finalState: string } {
+  if (!gate.converged) return { converged: false, finalState: '' }
+  if (isFailClosed(piFail, gate.channel)) {
+    return {
+      converged: false,
+      finalState: `第 ${gen} 代未收敛: 测试绿 + pi通道失败 + 复审降级(${gate.channel}) → fail-closed`,
+    }
+  }
+  return {
+    converged: true,
+    finalState: `第 ${gen} 代收敛: 测试绿 + danger=${piFail ? 'N/A(pi通道失败)' : danger} + ${gate.channel === 'codex' ? '复审' : `复审降级(${gate.channel})`} PASS`,
+  }
+}
+
 /** 复审门收尾统一语义 (2026-09-08 修复通道熔断)
  * 返回: log=rounds 记录串 / converged=真收敛 / stop=提前止损(全通道不可用) / finalState */
 async function settleGate(
@@ -866,7 +914,15 @@ ${t.out.slice(-1500)}
             // 修复后复测 (C3: 权重信号移至复测之后, 以复测结果为准; 委派失败不双计)
             t2 = await runVerify(verify, workdir)
             rounds[gen] += ` | ${agent}复测 ${t2.ok ? '绿 ✓' : '仍红'}`
-            updateAgentWeight(workdir, agent, agentWeightDelta(r.ok, t2), warn)
+            // P0-⑥: 零变更门 — 三条件齐才计权重 (git 有变更 + 与失败文件相交 + t2.ok)
+            const changedFiles = await getChangedFiles(workdir)
+            const failedFiles = failedFilesFromOutput(t.out)
+            const hasChange = hasRelevantChange(changedFiles, failedFiles)
+            const weightDelta = hasChange ? agentWeightDelta(r.ok, t2) : 0
+            if (!hasChange && t2.ok) {
+              rounds[gen] += ' | 零变更门: 无相关变更, 权重不增'
+            }
+            updateAgentWeight(workdir, agent, weightDelta, warn)
             if (t2.ok) {
               fixed = true
               prevPassed = true
@@ -891,8 +947,9 @@ ${t.out.slice(-1500)}
               rounds[gen] += g.log
               stats.review = { degraded: g.degraded, channel: g.channel }
               if (g.converged) {
-                converged = true
-                finalState = `第 ${gen} 代收敛: 测试绿 + danger=${piFail ? 'N/A(pi通道失败)' : review.danger} + ${g.channel === 'codex' ? '复审' : `复审降级(${g.channel})`} PASS`
+                const rc = resolveConvergence(g, piFail, gen, review.danger)
+                converged = rc.converged
+                finalState = rc.finalState
                 break
               }
               if (g.stop) {
@@ -923,8 +980,9 @@ ${t.out.slice(-1500)}
         rounds[gen] += g.log
         stats.review = { degraded: g.degraded, channel: g.channel }
         if (g.converged) {
-          converged = true
-          finalState = `第 ${gen} 代收敛: 测试绿 + danger=${piFail ? 'N/A(pi通道失败)' : review.danger} + ${g.channel === 'codex' ? '复审' : `复审降级(${g.channel})`} PASS`
+          const rc = resolveConvergence(g, piFail, gen, review.danger)
+          converged = rc.converged
+          finalState = rc.finalState
           break
         }
         if (g.stop) {

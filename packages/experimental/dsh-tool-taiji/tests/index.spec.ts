@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync, mkdirSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,6 +19,10 @@ import {
   bidJitter,
   fnv1a,
   failedFilesFromOutput,
+  getChangedFiles,
+  hasRelevantChange,
+  isFailClosed,
+  resolveConvergence,
 } from '../src/index.js'
 
 let td: string
@@ -261,5 +266,102 @@ describe('C7 execute 返回 stats', () => {
   it('execute 返回对象含 stats 字段 (结构断言)', () => {
     const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
     expect(src).toMatch(/stats:\s*\(r\.stats \?\? \{\}\)/)
+  })
+})
+
+/** P0-6: getChangedFiles 零变更门输入 */
+describe('P0-6 getChangedFiles 变更文件提取', () => {
+  it('git repo: modified + untracked 文件名都被正确返回 (非 .py 残片)', async () => {
+    execFileSync('git', ['init', '-q', td])
+    execFileSync('git', ['-C', td, 'config', 'user.email', 'test@example.com'])
+    execFileSync('git', ['-C', td, 'config', 'user.name', 'Test'])
+    writeFileSync(join(td, 'a.py'), 'v1\n')
+    execFileSync('git', ['-C', td, 'add', 'a.py'])
+    execFileSync('git', ['-C', td, 'commit', '-qm', 'init'])
+    writeFileSync(join(td, 'a.py'), 'v2\n')   // modified
+    writeFileSync(join(td, 'b.py'), 'new\n')  // untracked
+    const files = await getChangedFiles(td)
+    expect(files).toContain('a.py')
+    expect(files).toContain('b.py')
+    expect(files).not.toContain('.py')
+    expect(files).not.toContain('a')
+  })
+  it('非 git 仓库 → []', async () => {
+    writeFileSync(join(td, 'x.txt'), 'hi')
+    expect(await getChangedFiles(td)).toEqual([])
+  })
+})
+
+/** P0-6: hasRelevantChange 相交判定 */
+describe('P0-6 hasRelevantChange 零变更门相交判定', () => {
+  it('无变更 → false', () => {
+    expect(hasRelevantChange([], ['a.py'])).toBe(false)
+  })
+  it('无关变更 → false', () => {
+    expect(hasRelevantChange(['b.py'], ['a.py'])).toBe(false)
+  })
+  it('相关变更 (精确 / 双向 substring) → true', () => {
+    expect(hasRelevantChange(['a.py'], ['a.py'])).toBe(true)
+    expect(hasRelevantChange(['src/a.py'], ['a.py'])).toBe(true)
+    expect(hasRelevantChange(['a.py'], ['src/a.py'])).toBe(true)
+  })
+  it('空 failedFiles 降级 → 只看 changed 非空', () => {
+    expect(hasRelevantChange(['a.py'], [])).toBe(true)
+    expect(hasRelevantChange([], [])).toBe(false)
+  })
+})
+
+/** P0-6: isFailClosed fail-closed 判定 */
+describe('P0-6 isFailClosed pi 通道失败 + 降级', () => {
+  it('(true, opencode) → true', () => {
+    expect(isFailClosed(true, 'opencode')).toBe(true)
+  })
+  it('(true, codex) → false (正常路径不受影响)', () => {
+    expect(isFailClosed(true, 'codex')).toBe(false)
+  })
+  it('(false, opencode) → false', () => {
+    expect(isFailClosed(false, 'opencode')).toBe(false)
+  })
+})
+
+/** P0-6: resolveConvergence 收敛决策 (fail-closed 行为断言) */
+describe('P0-6 resolveConvergence 收敛决策', () => {
+  it('pi通道失败 + 复审降级 → converged=false + finalState 含 fail-closed', () => {
+    const rc = resolveConvergence({ converged: true, channel: 'opencode' }, true, 2, 40)
+    expect(rc.converged).toBe(false)
+    expect(rc.finalState).toContain('fail-closed')
+    expect(rc.finalState).toContain('未收敛')
+  })
+  it('pi通道失败 + codex 通道 → converged=true + PASS (正常路径不受影响)', () => {
+    const rc = resolveConvergence({ converged: true, channel: 'codex' }, true, 2, 40)
+    expect(rc.converged).toBe(true)
+    expect(rc.finalState).toContain('PASS')
+    expect(rc.finalState).not.toContain('fail-closed')
+  })
+  it('pi正常 + 复审降级 → converged=true', () => {
+    const rc = resolveConvergence({ converged: true, channel: 'opencode' }, false, 2, 30)
+    expect(rc.converged).toBe(true)
+    expect(rc.finalState).toContain('danger=30')
+    expect(rc.finalState).toContain('PASS')
+  })
+  it('gate.converged=false → converged=false + 空 finalState (不进收敛分支)', () => {
+    const rc = resolveConvergence({ converged: false, channel: 'opencode' }, true, 2, 40)
+    expect(rc.converged).toBe(false)
+    expect(rc.finalState).toBe('')
+  })
+  it('结构断言: 两处 if(g.converged) 块内紧随 break, 不落到 [复审FAIL] 喷洒', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    const matches = [...src.matchAll(/if \(g\.converged\) \{/g)]
+    expect(matches.length).toBe(2)
+    for (const m of matches) {
+      const idx = m.index ?? 0
+      const stopIdx = src.indexOf('if (g.stop)', idx)
+      expect(stopIdx).toBeGreaterThan(idx)
+      const block = src.slice(idx, stopIdx)
+      // 块内必须 resolveConvergence + break (保守终止), 不能穿透到 g.stop 之后的 [复审FAIL] 喷洒
+      expect(block).toContain('resolveConvergence(g, piFail, gen, review.danger)')
+      expect(block).toContain('break')
+      expect(block).not.toContain('[复审FAIL]')
+    }
   })
 })
