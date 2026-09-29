@@ -17,9 +17,9 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, unlinkSync, statSync } from 'node:fs'
 import { join, resolve, dirname, relative } from 'node:path'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 
 const execFileAsync = promisify(execFile)
@@ -252,23 +252,31 @@ export function bidJitter(seed: string): number {
   return fnv1a(seed) / 0x100000000
 }
 
+/** 竞标注入因子 (首次派单, 即排序后 top-1 agent 的注入状态)。 */
+export interface AuctionReputation {
+  agent: string
+  repFactor: number
+  streakPenalty: number
+}
+
 /** 高斯响应竞标: 每个 agent 有专长刺激区间, 概率微扰后排序 (降序)
  * 4.0 演进: 竞标分 × 信誉权重 (经验引导派单, 修复连续失败者权重下降,
  * 其它通道自动上位 — 修复通道从 claude 独占扩展为权重自动派单)。
  * P1-①: 多目标选择 — excludeFiles 排除已用文件后取 argmax 次优 (单候选自动降级)。
+ * P1-③: 竞标分注入全局信誉因子 repFactor × streakPenalty (跨 workdir 派单信誉)。
  * @param pm 信息素地图 (Pe/Pr 双态刺激)
  * @param workdir 工作目录 (读 agent 权重)
  * @param gen 当前代数 (进竞标微扰种子)
  * @param warn 落盘告警回调 (缺省 console.warn)
  * @param excludeFiles 排除的文件集 (多目标换靶时传前 N-1 个 agent 已用文件)
- * @returns 竞标选中的文件 + 排序后的 agent 列表 + 刺激值; 无候选返回 undefined */
+ * @returns 竞标选中的文件 + 排序后的 agent 列表 + 刺激值 + 首次派单注入因子; 无候选返回 undefined */
 export function auction(
   pm: PheromoneMap,
   workdir: string,
   gen: number,
   warn: WarnFn = console.warn,
   excludeFiles?: string[],
-): { file: string; agents: string[]; stimulus: number } | undefined {
+): { file: string; agents: string[]; stimulus: number; reputation?: AuctionReputation } | undefined {
   const candidates: string[] = []
   for (const [file, node] of Object.entries(pm)) {
     if ((node.Pe > 0 || node.Pr > 0) && !(excludeFiles ?? []).includes(file)) candidates.push(file)
@@ -278,15 +286,29 @@ export function auction(
     (stimulusOf(pm[a] ?? zeroNode) > stimulusOf(pm[b] ?? zeroNode) ? a : b))
   const s = stimulusOf(pm[file] ?? zeroNode)
   const weights = loadAgentWeights(workdir, warn)
-  const scored: Array<[string, number]> = []
+  const reps = loadGlobalReputation(warn)
+  const scored: Array<{ agent: string; score: number }> = []
   for (const [agent, peak] of Object.entries(AGENT_PEAKS)) {
     const w = weights[agent] ?? 0
     const jitter = bidJitter(`${workdir}\0${file}\0${agent}\0${gen}`)
     const score = Math.exp(-(((s - peak) / 60) ** 2)) * (0.85 + jitter * 0.3) * (1 + w * 0.2)
-    scored.push([agent, score])
+      * repFactor(reps[agent]) * streakPenalty(reps[agent])
+    scored.push({ agent, score })
   }
-  scored.sort((a, b) => b[1] - a[1])
-  return { file, agents: scored.map(([a]) => a), stimulus: s }
+  scored.sort((a, b) => b.score - a.score)
+  const top = scored[0]
+  return {
+    file,
+    agents: scored.map(a => a.agent),
+    stimulus: s,
+    ...(top ? {
+      reputation: {
+        agent: top.agent,
+        repFactor: repFactor(reps[top.agent]),
+        streakPenalty: streakPenalty(reps[top.agent]),
+      },
+    } : {}),
+  }
 }
 
 /** ── 4.0 演进: agent 信誉权重 (2026-09-01) ────────────────────────────
@@ -331,6 +353,123 @@ export function updateAgentWeight(workdir: string, agent: string, delta: number,
   w[key] = Number(((w[key] ?? 0) + delta).toFixed(3))
   saveAgentWeights(workdir, w)
 }
+
+/** ── P1-③: 全局 agent 信誉库 (跨 workdir 派单信誉 + 跨进程写保护) ────────────
+ * 独立文件 ~/.taiji/global-agent-reputation.json (env TAIJI_GLOBAL_REP 覆盖路径,
+ * TAIJI_GLOBAL_REP=0 全局关闭不读不写)。语义分离: workdir 权重=快/本地, 全局信誉=慢/跨仓库。
+ * win/loss/streak 状态机: win → wins+1, streak=0; loss → losses+1, streak+1。 */
+
+export interface AgentReputation {
+  wins: number
+  losses: number
+  streak: number
+  lastUpdated: number
+}
+
+export type ReputationMap = Record<string, AgentReputation>
+
+/** 注入阈值: 样本 (wins+losses) ≥ 5 才把胜率偏差注入竞标打分。 */
+const REP_MIN_SAMPLES = 5
+
+/** 乐观并发退避序列 (ms): 初始 1 次 + 3 次重试共 4 次写尝试, 第 4 次仍冲突则告警放弃。 */
+const REP_BACKOFF_MS = [50, 100, 200] as const
+
+/** 全局信誉文件路径: env TAIJI_GLOBAL_REP 非 '0' 时作覆盖路径, 缺省 ~/.taiji/global-agent-reputation.json。 */
+export function globalRepPath(): string {
+  const env = process.env.TAIJI_GLOBAL_REP
+  if (env && env !== '0') return env
+  return join(homedir(), '.taiji', 'global-agent-reputation.json')
+}
+
+/** TAIJI_GLOBAL_REP=0 → 全局关闭 (不读不写): loadGlobalReputation 返回 {}, recordReputation no-op。 */
+export function globalRepDisabled(): boolean {
+  return process.env.TAIJI_GLOBAL_REP === '0'
+}
+
+/** 全局信誉文件原始快照 (mtime + 内容, 乐观并发版本比对用)。文件不存在返回 undefined。 */
+interface GlobalRepSnapshot {
+  mtimeMs: number
+  content: string
+}
+
+function readGlobalRepRaw(path: string): GlobalRepSnapshot | undefined {
+  if (!existsSync(path)) return undefined
+  return { mtimeMs: statSync(path).mtimeMs, content: readFileSync(path, 'utf-8') }
+}
+
+/** 快照版本比对: 两者均 undefined 视为一致; 否则 mtime 与内容均一致才视为未变。 */
+function snapshotsEqual(a: GlobalRepSnapshot | undefined, b: GlobalRepSnapshot | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.mtimeMs === b.mtimeMs && a.content === b.content
+}
+
+/** 读全局信誉 (损坏 C4 纪律: 备份 .corrupt-* + 告警 + 空重建); TAIJI_GLOBAL_REP=0 短路返回 {}。 */
+export function loadGlobalReputation(warn: WarnFn = console.warn): ReputationMap {
+  if (globalRepDisabled()) return {}
+  const p = globalRepPath()
+  try {
+    if (existsSync(p)) return JSON.parse(readFileSync(p, 'utf-8')) as ReputationMap
+  } catch {
+    try { renameSync(p, `${p}.corrupt-${Date.now()}`) } catch { /* 备份失败不阻断 */ }
+    warn(`[taiji] 全局信誉文件损坏, 已备份为 ${p}.corrupt-*, 重建为空`)
+  }
+  return {}
+}
+
+/** win/loss/streak 状态机 (纯函数): win → wins+1, streak=0; loss → losses+1, streak+1。
+ * 3 连败后 win 重置 streak=0 (AC-1); lastUpdated 记录更新时刻 epoch ms。
+ * @param rep 既有信誉记录 (缺省视为全零)
+ * @param win 本次是否修复成功
+ * @param now 更新时刻 epoch ms (缺省 Date.now(); 单测注入固定值保确定性) */
+export function applyReputation(rep: AgentReputation | undefined, win: boolean, now: number = Date.now()): AgentReputation {
+  const cur = rep ?? { wins: 0, losses: 0, streak: 0, lastUpdated: now }
+  return win
+    ? { wins: cur.wins + 1, losses: cur.losses, streak: 0, lastUpdated: now }
+    : { wins: cur.wins, losses: cur.losses + 1, streak: cur.streak + 1, lastUpdated: now }
+}
+
+/** 竞标注入因子 (胜率偏差 ±10%): 样本 ≥ REP_MIN_SAMPLES 才注入, 否则 1.0 (不注入)。 */
+export function repFactor(rep: AgentReputation | undefined): number {
+  if (!rep) return 1
+  const sample = rep.wins + rep.losses
+  if (sample < REP_MIN_SAMPLES) return 1
+  return 1 + (rep.wins / sample - 0.5) * 0.2
+}
+
+/** 连败惩罚: streak ≥ 3 降 15% → 0.85, 否则 1.0。 */
+export function streakPenalty(rep: AgentReputation | undefined): number {
+  if (!rep) return 1
+  return rep.streak >= 3 ? 0.85 : 1
+}
+
+/** 同步退避 (Atomics.wait 无 CPU 空转、无新依赖)。 */
+function sleepSync(ms: number): void {
+  const buf = new Int32Array(new SharedArrayBuffer(4))
+  Atomics.wait(buf, 0, 0, ms)
+}
+
+/** 记录一次全局信誉 (乐观并发读-改-写 + 退避重试, 非锁)。
+ * 每轮: 读快照 → 读+损坏 C4 → applyReputation 算 next → 再读快照比对;
+ * 未变则原子写; 变了则退避重试; 初始 1 次 + 3 次重试共 4 次写尝试仍冲突 → 告警放弃不抛。
+ * TAIJI_GLOBAL_REP=0 时 no-op; 写失败不阻断主循环。 */
+export function recordReputation(agent: string, win: boolean, warn: WarnFn = console.warn): void {
+  if (globalRepDisabled()) return
+  const path = globalRepPath()
+  const backoffs = REP_BACKOFF_MS
+  for (let attempt = 0; attempt <= backoffs.length; attempt++) {
+    const before = readGlobalRepRaw(path)
+    const map = loadGlobalReputation(warn)
+    const next: ReputationMap = { ...map, [agent]: applyReputation(map[agent], win) }
+    const after = readGlobalRepRaw(path)
+    if (snapshotsEqual(before, after)) {
+      try { atomicWriteJson(path, next) } catch { /* 写失败不阻断主循环 */ }
+      return
+    }
+    if (attempt < backoffs.length) sleepSync(backoffs[attempt] ?? 0)
+  }
+  warn(`[taiji] 全局信誉并发冲突, ${backoffs.length} 次重试仍失败, 放弃本次写入 (agent=${agent})`)
+}
+
 function stimulusOf(node: PheromoneNode): number {
   return node.Pe + node.Pr * STIMULUS_PR_FACTOR
 }
@@ -1144,6 +1283,35 @@ export function buildEvidence(input: {
   }
 }
 
+/** runs 落盘记录 (P1-③): 纯函数组装 taijiRunInner 的 runs JSON 对象,
+ * 抽离使「stats.reputation → runs JSON」可运行时断言 (非字符串证据)。
+ * @param input 运行期变量 (reputation 为首次派单注入因子, 缺省落 null)
+ * @returns 与 taijiRunInner 内联对象逐字段一致的 runs 记录 */
+export function buildRunsRecord(input: {
+  goal: string
+  workdir: string
+  verify: string
+  sandbox: string
+  dims: string[] | undefined
+  converged: boolean
+  finalState: string
+  rounds: Record<number, string>
+  review: unknown
+  reputation: unknown
+  params: EffectiveParams
+  evidence: unknown
+}): Record<string, unknown> {
+  const { goal, workdir, verify, sandbox, dims, converged, finalState, rounds, review, reputation, params, evidence } = input
+  return {
+    ts: Date.now(), goal, workdir, verify, sandbox, dims: dims ?? 'default',
+    converged, finalState, roundsUsed: Object.keys(rounds).length,
+    rounds, review: review ?? null,
+    reputation: reputation ?? null,
+    params,
+    evidence: evidence ?? null,
+  }
+}
+
 /** 复审门收尾统一语义 (2026-09-08 修复通道熔断)
  * 返回: log=rounds 记录串 / converged=真收敛 / stop=提前止损(全通道不可用) / finalState */
 async function settleGate(
@@ -1259,6 +1427,7 @@ async function taijiRunInner(
         stats.sandbox_enforced = true
       } else {
         const target = auction(pm, workdir, gen, warn)
+        stats.reputation = target?.reputation
         if (target) {
           // P1-①: 多目标选择 — 第 N 个 agent 排除前 N-1 个 agent 已用文件, 打不同靶
           const usedFiles: string[] = []
@@ -1312,6 +1481,8 @@ ${t.out.slice(-1500)}
               rounds[gen] += ' | 零变更门: 无相关变更, 权重不增'
             }
             updateAgentWeight(workdir, agent, weightDelta, warn)
+            // P1-③: 全局信誉 (与 P0-⑥ 零变更门同信号源: win = 复测绿 + 相关变更, 其余一律 loss)
+            recordReputation(agent, t2.ok && weightDelta > 0, warn)
             // P1-C: 异源机械判官层 — 零变更门之后接线 (diffFiles 非空但含禁止模式/工具链缺失等硬 fail)
             const gates = await mechanicalGates({
               workdir,
@@ -1442,13 +1613,14 @@ ${t.out.slice(-1500)}
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
     writeFileSync(
       join(runsDir, `run-${stamp}.json`),
-      JSON.stringify({
-        ts: Date.now(), goal, workdir, verify, sandbox, dims: dims ?? 'default',
-        converged, finalState, roundsUsed: Object.keys(rounds).length,
-        rounds, review: stats.review ?? null,
+      JSON.stringify(buildRunsRecord({
+        goal, workdir, verify, sandbox, dims,
+        converged, finalState, rounds,
+        review: stats.review,
+        reputation: stats.reputation,
         params: effectiveParams(),
-        evidence: evidence ?? null,
-      }, null, 2),
+        evidence,
+      }), null, 2),
       'utf-8',
     )
   } catch { /* 落盘失败不影响交付 */ }

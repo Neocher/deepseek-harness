@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync, mkdirSync, statSync, utimesSync } from 'node:fs'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fs, { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync, mkdirSync, statSync, utimesSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { syncBuiltinESMExports } from 'node:module'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 import {
@@ -29,20 +30,31 @@ import {
   resolvePrNote,
   setProjectNote,
   buildEvidence,
+  buildRunsRecord,
   probeEcosystem,
   tsAcceptanceBody,
   genAcceptanceTest,
   verifyWithAcceptance,
   effectiveParams,
   pheromoneDistribution,
+  globalRepPath,
+  globalRepDisabled,
+  loadGlobalReputation,
+  recordReputation,
+  applyReputation,
+  repFactor,
+  streakPenalty,
 } from '../src/index.js'
 
 let td: string
 beforeEach(() => {
   td = mkdtempSync(join(tmpdir(), 'taiji-test-'))
+  // 全局信誉文件路径注入 tmp 目录 (隔离, 不写真实 ~/.taiji)
+  process.env.TAIJI_GLOBAL_REP = join(td, 'global-agent-reputation.json')
 })
 afterEach(() => {
   rmSync(td, { recursive: true, force: true })
+  delete process.env.TAIJI_GLOBAL_REP
   delete process.env.TAIJI_VERIFY_SHELL_OK
   delete process.env.TAIJI_RANDOM_BID
   delete process.env.TAIJI_FAILED_FILE_RE
@@ -812,5 +824,177 @@ describe('P1-⑤ 参数暴露 + 分布日志', () => {
     expect(src).not.toContain('node.Pe * 0.5')
     expect(src).not.toContain('node.Pr * 0.8')
     expect(src).not.toContain('node.Pr * 0.5')
+  })
+})
+
+/** P1-③: 全局 agent 信誉库 (跨 workdir 派单信誉 + 跨进程写保护) */
+describe('P1-③ 全局 agent 信誉库', () => {
+  it('applyReputation 状态机: win → wins+1/streak=0; loss → losses+1/streak+1; 3 连败后 win 重置 streak (AC-1)', () => {
+    const now = 1_700_000_000_000
+    const rep = (w: number, l: number, s: number) => ({ wins: w, losses: l, streak: s, lastUpdated: now })
+    expect(applyReputation(undefined, true, now)).toEqual(rep(1, 0, 0))
+    expect(applyReputation(rep(2, 1, 0), true, now)).toEqual(rep(3, 1, 0))
+    expect(applyReputation(rep(2, 1, 0), false, now)).toEqual(rep(2, 2, 1))
+    // 3 连败后 win → streak 归零
+    expect(applyReputation(rep(0, 3, 3), true, now)).toEqual(rep(1, 3, 0))
+    // loss 继续累积 streak
+    expect(applyReputation(rep(0, 2, 2), false, now)).toEqual(rep(0, 3, 3))
+  })
+
+  it('repFactor: 100%样本10→1.1; 50%→1.0; 样本3不注入→1.0; 全败→0.9; undefined→1.0 (AC-3)', () => {
+    const now = 1_700_000_000_000
+    expect(repFactor({ wins: 10, losses: 0, streak: 0, lastUpdated: now })).toBeCloseTo(1.1, 5)
+    expect(repFactor({ wins: 5, losses: 5, streak: 0, lastUpdated: now })).toBeCloseTo(1.0, 5)
+    expect(repFactor({ wins: 3, losses: 0, streak: 0, lastUpdated: now })).toBe(1.0)
+    expect(repFactor({ wins: 0, losses: 10, streak: 10, lastUpdated: now })).toBeCloseTo(0.9, 5)
+    expect(repFactor(undefined)).toBe(1.0)
+  })
+
+  it('streakPenalty: 连败3→0.85; 连败2→1.0; undefined→1.0 (AC-3)', () => {
+    const now = 1_700_000_000_000
+    expect(streakPenalty({ wins: 0, losses: 3, streak: 3, lastUpdated: now })).toBe(0.85)
+    expect(streakPenalty({ wins: 0, losses: 2, streak: 2, lastUpdated: now })).toBe(1.0)
+    expect(streakPenalty(undefined)).toBe(1.0)
+  })
+
+  it('recordReputation 落盘: 首次 win 写入, 再次 loss 读-改-写合并 (AC-2)', () => {
+    expect(globalRepPath()).toBe(join(td, 'global-agent-reputation.json'))
+    recordReputation('claude_code', true, () => {})
+    expect(loadGlobalReputation(() => {})).toMatchObject({ claude_code: { wins: 1, losses: 0, streak: 0 } })
+    recordReputation('claude_code', false, () => {})
+    const after = loadGlobalReputation(() => {})
+    expect(after).toMatchObject({ claude_code: { wins: 1, losses: 1, streak: 1 } })
+    // lastUpdated 落盘为 epoch ms 数字 (spec 字段, 非静默丢弃)
+    expect(typeof after.claude_code?.lastUpdated).toBe('number')
+  })
+
+  it('损坏全局信誉文件 → .corrupt-* 备份 + 告警 + 空重建 (C4)', () => {
+    const path = globalRepPath()
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, '{broken')
+    const warns: string[] = []
+    expect(loadGlobalReputation(m => warns.push(m))).toEqual({})
+    expect(warns.some(w => w.includes('损坏'))).toBe(true)
+    expect(readdirSync(dirname(path)).some(f => f.includes('.corrupt-'))).toBe(true)
+    expect(existsSync(path)).toBe(false)
+  })
+
+  it('TAIJI_GLOBAL_REP=0 → recordReputation no-op 不写文件, loadGlobalReputation 返回 {} (AC-4)', () => {
+    process.env.TAIJI_GLOBAL_REP = '0'
+    const warns: string[] = []
+    expect(globalRepDisabled()).toBe(true)
+    expect(loadGlobalReputation(m => warns.push(m))).toEqual({})
+    // 短路: recordReputation 不触碰文件 (statSync 不被调用) 且不告警
+    const stat = vi.spyOn(fs, 'statSync')
+    try {
+      syncBuiltinESMExports()
+      recordReputation('opencode', true, m => warns.push(m))
+      expect(stat).not.toHaveBeenCalled()
+    } finally {
+      stat.mockRestore()
+      syncBuiltinESMExports()
+    }
+    expect(warns).toEqual([])
+  })
+
+  it('乐观并发重试合并: 冲突后重试, 最终态含两次更新 (AC-2/AC-7)', () => {
+    const path = globalRepPath()
+    atomicWriteJson(path, {})
+    const original = fs.statSync
+    let statCalls = 0
+    const stat = vi.spyOn(fs, 'statSync')
+    try {
+      stat.mockImplementation(new Proxy(original, {
+        apply(target, receiver: unknown, args: unknown[]): unknown {
+          statCalls++
+          const result: unknown = Reflect.apply(target, receiver, args)
+          // 第 2 次 statSync (attempt0 的 after 读) 模拟另一进程并发写 opencode
+          if (statCalls === 2) {
+            const map = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>
+            map.opencode = { wins: 1, losses: 0, streak: 0, lastUpdated: 1_700_000_000_000 }
+            writeFileSync(path, JSON.stringify(map))
+          }
+          return result
+        },
+      }))
+      syncBuiltinESMExports()
+      recordReputation('claude_code', true, () => {})
+    } finally {
+      stat.mockRestore()
+      syncBuiltinESMExports()
+    }
+    const final = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, { wins: number; losses: number; streak: number; lastUpdated: number }>
+    expect(final.opencode).toMatchObject({ wins: 1, losses: 0, streak: 0 })
+    expect(final.claude_code).toMatchObject({ wins: 1, losses: 0, streak: 0 })
+    // 并发注入的 opencode 保留其 lastUpdated, 未被本进程覆盖
+    expect(final.opencode?.lastUpdated).toBe(1_700_000_000_000)
+  })
+
+  it('连续 3 次冲突 → warn 告警且不抛错, 文件保持原样 (AC-2/AC-8)', () => {
+    const path = globalRepPath()
+    atomicWriteJson(path, {})
+    const original = fs.statSync
+    let mtimeTick = Date.now() + 60_000
+    const stat = vi.spyOn(fs, 'statSync')
+    const warns: string[] = []
+    try {
+      stat.mockImplementation(new Proxy(original, {
+        apply(target, receiver: unknown, args: unknown[]): unknown {
+          const result: unknown = Reflect.apply(target, receiver, args)
+          // 每次 statSync 后拨 mtime (单调递增), 制造持续冲突
+          mtimeTick += 1000
+          try { utimesSync(path, new Date(mtimeTick), new Date(mtimeTick)) } catch { /* 忽略 */ }
+          return result
+        },
+      }))
+      syncBuiltinESMExports()
+      expect(() => { recordReputation('claude_code', true, m => warns.push(m)) }).not.toThrow()
+    } finally {
+      stat.mockRestore()
+      syncBuiltinESMExports()
+    }
+    expect(warns.some(w => w.includes('冲突'))).toBe(true)
+    expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({})
+  })
+
+  it('auction 返回 reputation: top-1 agent 注入因子正确记录 (AC-4)', () => {
+    const pm = { 'a.py': { Pe: 90, Pr: 0, complexity: 0 } }
+    atomicWriteJson(globalRepPath(), {
+      claude_code: { wins: 10, losses: 0, streak: 0, lastUpdated: 1_700_000_000_000 },
+      opencode: { wins: 0, losses: 3, streak: 3, lastUpdated: 1_700_000_000_000 },
+    })
+    const r = auction(pm, td, 1, () => {})
+    expect(r).toBeDefined()
+    expect(r?.reputation).toBeDefined()
+    expect(r?.reputation?.agent).toBe(r?.agents?.[0])
+    const reps = loadGlobalReputation(() => {})
+    const topAgent = r?.reputation?.agent ?? ''
+    expect(r?.reputation?.repFactor).toBeCloseTo(repFactor(reps[topAgent]), 5)
+    expect(r?.reputation?.streakPenalty).toBeCloseTo(streakPenalty(reps[topAgent]), 5)
+  })
+
+  it('接线 (结构断言): auction 注入 repFactor×streakPenalty + stats.reputation 落 runs + recordReputation 同信号源 (AC-4)', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('* repFactor(reps[agent]) * streakPenalty(reps[agent])')
+    expect(src).toContain('stats.reputation = target?.reputation')
+    expect(src).toContain('buildRunsRecord({')
+    expect(src).toContain('reputation: stats.reputation')
+    expect(src).toContain('recordReputation(agent, t2.ok && weightDelta > 0, warn)')
+  })
+
+  it('buildRunsRecord: stats.reputation 落入 runs 记录 (行为断言, AC-4)', () => {
+    const base = {
+      goal: 'g', workdir: '/w', verify: 'true', sandbox: 'full', dims: undefined,
+      converged: false, finalState: '', rounds: { 1: 'x' },
+      review: undefined, params: effectiveParams(), evidence: undefined,
+    }
+    const rec = buildRunsRecord({
+      ...base,
+      reputation: { agent: 'opencode', repFactor: 1.1, streakPenalty: 0.85 },
+    })
+    expect(rec.reputation).toEqual({ agent: 'opencode', repFactor: 1.1, streakPenalty: 0.85 })
+    // 无 reputation 时落 null (而非 undefined, 保证 JSON 序列化确定性)
+    const none = buildRunsRecord({ ...base, reputation: undefined })
+    expect(none.reputation).toBeNull()
   })
 })
