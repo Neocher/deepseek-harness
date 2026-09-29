@@ -21,6 +21,8 @@ import {
   failedFilesFromOutput,
   getChangedFiles,
   hasRelevantChange,
+  filesIntersect,
+  mechanicalGates,
   isFailClosed,
   resolveConvergence,
   resolvePrNote,
@@ -36,6 +38,7 @@ afterEach(() => {
   delete process.env.TAIJI_VERIFY_SHELL_OK
   delete process.env.TAIJI_RANDOM_BID
   delete process.env.TAIJI_FAILED_FILE_RE
+  delete process.env.TAIJI_TSC_BIN
 })
 
 /** C1: sandbox 分级 */
@@ -361,7 +364,7 @@ describe('P0-6 resolveConvergence 收敛决策', () => {
       expect(stopIdx).toBeGreaterThan(idx)
       const block = src.slice(idx, stopIdx)
       // 块内必须 resolveConvergence + break (保守终止), 不能穿透到 g.stop 之后的 [复审FAIL] 喷洒
-      expect(block).toContain('resolveConvergence(g, piFail, gen, review.danger)')
+      expect(block).toContain('resolveConvergence(g, piFail, gen, review.danger, mechanicalGateBlock)')
       expect(block).toContain('break')
       expect(block).not.toContain('[复审FAIL]')
     }
@@ -404,5 +407,97 @@ describe('P1-2 Pr_note 写读键断链', () => {
       __project__: { Pe: 0, Pr: 0, complexity: 30, Pr_note: 'G' },
     }
     expect(resolvePrNote(pm, 'foo')).toBe('F')
+  })
+})
+
+/** P1-C: 异源机械判官层 */
+describe('P1-C 机械判官层', () => {
+  it('filesIntersect: 双向 substring 相交判定', () => {
+    expect(filesIntersect(['a.py'], ['a.py'])).toBe(true)
+    expect(filesIntersect(['src/a.py'], ['a.py'])).toBe(true)
+    expect(filesIntersect(['a.py'], ['src/a.py'])).toBe(true)
+    expect(filesIntersect(['a.py'], ['b.py'])).toBe(false)
+    expect(filesIntersect([], ['a.py'])).toBe(false)
+  })
+
+  it('gate-zero-change: 空 diffFiles fail / 非空 ok', async () => {
+    const empty = await mechanicalGates({ workdir: td, diffFiles: [], failedFiles: [], verify: 'pytest -q' })
+    expect(empty[0]?.name).toBe('gate-zero-change')
+    expect(empty[0]?.ok).toBe(false)
+    expect(empty[0]?.detail).toContain('0')
+
+    const nonEmpty = await mechanicalGates({ workdir: td, diffFiles: ['a.py'], failedFiles: [], verify: 'pytest -q' })
+    expect(nonEmpty[0]?.ok).toBe(true)
+  })
+
+  it('gate-scope: 有交集 ok / 无交集 fail / 无 failedFiles 跳过', async () => {
+    const hit = await mechanicalGates({ workdir: td, diffFiles: ['a.py'], failedFiles: ['a.py'], verify: 'pytest -q' })
+    expect(hit[1]?.name).toBe('gate-scope')
+    expect(hit[1]?.ok).toBe(true)
+
+    const miss = await mechanicalGates({ workdir: td, diffFiles: ['a.py'], failedFiles: ['b.py'], verify: 'pytest -q' })
+    expect(miss[1]?.ok).toBe(false)
+
+    const none = await mechanicalGates({ workdir: td, diffFiles: ['a.py'], failedFiles: [], verify: 'pytest -q' })
+    expect(none[1]?.ok).toBe(true)
+    expect(none[1]?.detail).toContain('跳过')
+  })
+
+  it('gate-typecheck: 非 TS 生态跳过', async () => {
+    const r = await mechanicalGates({ workdir: td, diffFiles: ['a.py'], failedFiles: [], verify: 'pytest -q', tsconfigAvailable: true })
+    expect(r[2]?.name).toBe('gate-typecheck')
+    expect(r[2]?.ok).toBe(true)
+    expect(r[2]?.detail).toContain('非 TS 生态')
+  })
+
+  it('gate-typecheck: tsc 不可用 fail (detail 含 tsc 不可用)', async () => {
+    process.env.TAIJI_TSC_BIN = 'definitely-missing-tsc-bin-xyz'
+    const r = await mechanicalGates({ workdir: td, diffFiles: ['a.ts'], failedFiles: [], verify: 'pytest -q', tsconfigAvailable: true })
+    expect(r[2]?.name).toBe('gate-typecheck')
+    expect(r[2]?.ok).toBe(false)
+    expect(r[2]?.detail).toContain('tsc 不可用')
+  })
+
+  it('gate-forbidden-patterns: 裸 except 命中 + 行号 (硬 fail, 无 warn-level)', async () => {
+    writeFileSync(join(td, 'x.py'), 'def f():\n    try:\n        pass\n    except:\n        pass\n')
+    const r = await mechanicalGates({ workdir: td, diffFiles: ['x.py'], failedFiles: [], verify: 'pytest -q' })
+    expect(r[3]?.name).toBe('gate-forbidden-patterns')
+    expect(r[3]?.ok).toBe(false)
+    expect(r[3]?.detail).toContain('x.py:4')
+    expect(r[3]?.detail).not.toContain('warn-level')
+  })
+
+  it('gate-forbidden-patterns: 空 catch 命中 + 行号', async () => {
+    writeFileSync(join(td, 'y.ts'), 'try {\n  foo()\n} catch (e) {\n}\n')
+    const r = await mechanicalGates({ workdir: td, diffFiles: ['y.ts'], failedFiles: [], verify: 'pytest -q' })
+    expect(r[3]?.ok).toBe(false)
+    expect(r[3]?.detail).toContain('y.ts:3')
+    expect(r[3]?.detail).not.toContain('warn-level')
+  })
+
+  it('gate-forbidden-patterns: console.log 命中 detail 含 warn-level', async () => {
+    writeFileSync(join(td, 'z.js'), 'function f() {\n  console.log("x")\n}\n')
+    const r = await mechanicalGates({ workdir: td, diffFiles: ['z.js'], failedFiles: [], verify: 'pytest -q' })
+    expect(r[3]?.ok).toBe(false)
+    expect(r[3]?.detail).toContain('warn-level')
+  })
+
+  it('gate-forbidden-patterns: 干净文件 ok', async () => {
+    writeFileSync(join(td, 'clean.ts'), 'export const x = 1\n')
+    const r = await mechanicalGates({ workdir: td, diffFiles: ['clean.ts'], failedFiles: [], verify: 'pytest -q' })
+    expect(r[3]?.ok).toBe(true)
+    expect(r[3]?.detail).toContain('无禁止模式')
+  })
+
+  it('resolveConvergence: gateBlocked=true → converged=false + finalState 含 机械门FAIL', () => {
+    const rc = resolveConvergence({ converged: true, channel: 'codex' }, false, 2, 30, true)
+    expect(rc.converged).toBe(false)
+    expect(rc.finalState).toContain('机械门FAIL')
+  })
+
+  it('resolveConvergence: gateBlocked 缺省 → 行为不变 (codex PASS)', () => {
+    const rc = resolveConvergence({ converged: true, channel: 'codex' }, true, 2, 40)
+    expect(rc.converged).toBe(true)
+    expect(rc.finalState).toContain('PASS')
   })
 })

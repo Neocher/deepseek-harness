@@ -351,12 +351,144 @@ export async function getChangedFiles(workdir: string): Promise<string[]> {
   }
 }
 
+/** 双向 substring 相交判定: a 中任一路径与 b 中任一路径互相包含即命中
+ * (零变更门与 gate-scope 门共用, 避免两份相交逻辑漂移)。 */
+export function filesIntersect(a: string[], b: string[]): boolean {
+  return a.some(af => b.some(bf => af.includes(bf) || bf.includes(af)))
+}
+
 /** 零变更门相交判定: 变更文件集与失败文件集是否存在任一双向 substring 命中。
  * 空 changed → false (无变更不计权重); 空 failed → 降级为只看 changed 非空。 */
 export function hasRelevantChange(changedFiles: string[], failedFiles: string[]): boolean {
   if (changedFiles.length === 0) return false
   if (failedFiles.length === 0) return true
-  return changedFiles.some(cf => failedFiles.some(ff => cf.includes(ff) || ff.includes(cf)))
+  return filesIntersect(changedFiles, failedFiles)
+}
+
+/** 单门判定结果: 门名 + 独立布尔 + detail (供 D 证据链落盘)。 */
+export interface GateResult { name: string; ok: boolean; detail: string }
+
+/** mechanicalGates 入参: 复用 getChangedFiles/failedFilesFromOutput 产物;
+ * tsconfigAvailable 由调用方探测后传入 (函数自身不碰 existsSync, 保持纯函数)。 */
+export interface MechanicalGateInput {
+  workdir: string
+  diffFiles: string[]
+  failedFiles: string[]
+  verify: string
+  tsconfigAvailable?: boolean
+}
+
+/** 禁止模式门规则 (P2 外置 .taiji/gates.json 留口): re 存无 /g 源,
+ * 扫描时 new RegExp(source, 'g') 重建, 规避跨文件共享 lastIndex。 */
+interface ForbiddenRule {
+  id: string
+  re: RegExp
+  langs: string[] | null
+  warn: boolean
+}
+
+const GATE_RULES: { forbiddenPatterns: ForbiddenRule[] } = {
+  forbiddenPatterns: [
+    { id: 'bare-except', re: /\bexcept\s*:/, langs: ['.py'], warn: false },
+    { id: 'empty-catch', re: /\bcatch\s*\(\s*\w+\s*\)\s*\{\s*\}/, langs: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'], warn: false },
+    { id: 'console-log', re: /\bconsole\.log\s*\(/, langs: null, warn: true },
+  ],
+}
+
+/** 计算 text 中 index 之前 (含) 的换行数 + 1 = 1-based 行号。 */
+function lineNumberAt(text: string, index: number): number {
+  let line = 1
+  for (let i = 0; i < index; i++) {
+    if (text[i] === '\n') line++
+  }
+  return line
+}
+
+/** gate-typecheck: TS 生态 (tsconfigAvailable) 且有 .ts/.tsx 变更 → 工具链可用性探测
+ * (非全量 typecheck, spec 明示 monorepo 全量 tsc 太贵)。env TAIJI_TSC_BIN 覆盖二进制名
+ * (默认 npx/args ['tsc','--version']; 覆盖时 args ['--version']), 60s 超时 fail-closed。 */
+async function gateTypecheck(diffFiles: string[], tsconfigAvailable?: boolean): Promise<GateResult> {
+  const hasTsChange = diffFiles.some(f => /\.tsx?$/.test(f))
+  if (!tsconfigAvailable || !hasTsChange) {
+    return { name: 'gate-typecheck', ok: true, detail: '非 TS 生态, 跳过' }
+  }
+  const bin = process.env.TAIJI_TSC_BIN ?? 'npx'
+  const args = process.env.TAIJI_TSC_BIN ? ['--version'] : ['tsc', '--version']
+  try {
+    const { stdout } = await execFileAsync(bin, args, { timeout: 60_000, maxBuffer: 1024 * 1024 })
+    const ver = (stdout || '').trim()
+    return { name: 'gate-typecheck', ok: true, detail: ver ? `tsc 可用: ${ver}` : 'tsc 可用' }
+  } catch (e) {
+    const err = e as { killed?: boolean; signal?: string }
+    const timedOut = err.killed === true || err.signal === 'SIGTERM'
+    const p = execErrProps(e)
+    const detail = timedOut
+      ? 'tsc 不可用: timeout'
+      : `tsc 不可用: ${p.message || p.stderr || '探测失败'}`
+    return { name: 'gate-typecheck', ok: false, detail }
+  }
+}
+
+/** gate-forbidden-patterns: 对 diffFiles 逐个读文件 (只读新增/修改, 非全仓库) 扫禁止模式,
+ * 命中列 文件:行号。硬命中 (bare-except/empty-catch) 优先: detail 不含 warn-level 字面;
+ * 仅 console.log (warn) 命中时才标 warn-level, 供调用方决定硬 fail 还是记录。 */
+async function gateForbiddenPatterns(workdir: string, diffFiles: string[]): Promise<GateResult> {
+  const hardHits: string[] = []
+  const warnHits: string[] = []
+  for (const f of diffFiles) {
+    let content: string
+    try {
+      content = readFileSync(join(workdir, f), 'utf-8')
+    } catch {
+      continue // 已删除/不存在的 diffFile 跳过, 不阻断整门 (A5)
+    }
+    for (const rule of GATE_RULES.forbiddenPatterns) {
+      if (rule.langs !== null && !rule.langs.some(ext => f.endsWith(ext))) continue
+      const re = new RegExp(rule.re.source, 'g')
+      let m: RegExpExecArray | null
+      while ((m = re.exec(content)) !== null) {
+        const entry = `${f}:${lineNumberAt(content, m.index)}`
+        if (rule.warn) warnHits.push(entry)
+        else hardHits.push(entry)
+      }
+    }
+  }
+  if (hardHits.length > 0) {
+    const detail = [`禁止模式: ${hardHits.join(', ')}`]
+    if (warnHits.length > 0) detail.push(`告警: ${warnHits.join(', ')}`)
+    return { name: 'gate-forbidden-patterns', ok: false, detail: detail.join('; ') }
+  }
+  if (warnHits.length > 0) {
+    return { name: 'gate-forbidden-patterns', ok: false, detail: `warn-level: console.log 残留 ${warnHits.join(', ')}` }
+  }
+  return { name: 'gate-forbidden-patterns', ok: true, detail: '无禁止模式命中' }
+}
+
+/** 异源机械判官层 (export 纯函数): 四门全跑完再汇总, 任一硬 fail 不阻断其他门判定。
+ * 返回固定顺序 [gate-zero-change, gate-scope, gate-typecheck, gate-forbidden-patterns]。 */
+export async function mechanicalGates(input: MechanicalGateInput): Promise<GateResult[]> {
+  const { workdir, diffFiles, failedFiles, tsconfigAvailable } = input
+
+  const zeroChange: GateResult = diffFiles.length > 0
+    ? { name: 'gate-zero-change', ok: true, detail: `变更文件 ${diffFiles.length} 个` }
+    : { name: 'gate-zero-change', ok: false, detail: `零变更 (diffFiles 共 ${diffFiles.length} 个文件)` }
+
+  let scope: GateResult
+  if (failedFiles.length === 0) {
+    scope = { name: 'gate-scope', ok: true, detail: '无失败文件可对比, 跳过' }
+  } else {
+    const hit = filesIntersect(diffFiles, failedFiles)
+    scope = hit
+      ? { name: 'gate-scope', ok: true, detail: `变更与失败文件相交 (${diffFiles.length} 变更 vs ${failedFiles.length} 失败)` }
+      : { name: 'gate-scope', ok: false, detail: `变更文件与失败文件无交集 (${diffFiles.length} 变更 vs ${failedFiles.length} 失败)` }
+  }
+
+  const [typecheck, forbidden] = await Promise.all([
+    gateTypecheck(diffFiles, tsconfigAvailable),
+    gateForbiddenPatterns(workdir, diffFiles),
+  ])
+
+  return [zeroChange, scope, typecheck, forbidden]
 }
 
 /** 读端评审意见解析 (P1-②): 优先本文件 Pr_note; 无则回退 __project__ 全局评审意见。
@@ -782,6 +914,7 @@ export function isFailClosed(piFail: boolean, channel: string): boolean {
 }
 
 /** 收敛决策 (P0-⑥): 把 `if (g.converged)` 后的分支收拢为纯决策, 使 fail-closed 行为可单测。
+ * 机械门硬 fail (gateBlocked) → 不收敛 + 含 "机械门FAIL" 文案 (优先于 fail-closed, 新证据优先);
  * fail-closed (pi 通道失败 + 复审降级) → 不收敛 + 含 "fail-closed" 文案 (调用方保守终止循环);
  * 否则 → 收敛 + PASS 文案。gate.converged 为 false 时返回空文案 (调用方不进此分支)。 */
 export function resolveConvergence(
@@ -789,8 +922,15 @@ export function resolveConvergence(
   piFail: boolean,
   gen: number,
   danger: number,
+  gateBlocked?: boolean,
 ): { converged: boolean; finalState: string } {
   if (!gate.converged) return { converged: false, finalState: '' }
+  if (gateBlocked) {
+    return {
+      converged: false,
+      finalState: `第 ${gen} 代未收敛: 测试绿 + 机械门FAIL → 机械门硬 fail 阻断收敛`,
+    }
+  }
   if (isFailClosed(piFail, gate.channel)) {
     return {
       converged: false,
@@ -855,6 +995,7 @@ async function taijiRunInner(
   let pm = loadPheromones(workdir, warn)
   const rounds: Record<number, string> = {}
   let prevPassed = false
+  let mechanicalGateBlock = false   // 机械门硬 fail → 即使测试绿也不收敛 (gen 循环内每代重置)
   let converged = false
   let finalState = ''
   const stats: Record<string, unknown> = { sandbox, dims: dims ?? 'default' }
@@ -886,6 +1027,7 @@ async function taijiRunInner(
 
   for (let gen = 1; gen <= maxRounds; gen++) {
     signal.throwIfAborted()
+    mechanicalGateBlock = false
     pm = evaporate(loadPheromones(workdir, warn), prevPassed)
 
     // 测试
@@ -948,6 +1090,20 @@ ${t.out.slice(-1500)}
               rounds[gen] += ' | 零变更门: 无相关变更, 权重不增'
             }
             updateAgentWeight(workdir, agent, weightDelta, warn)
+            // P1-C: 异源机械判官层 — 零变更门之后接线 (diffFiles 非空但含禁止模式/工具链缺失等硬 fail)
+            const gates = await mechanicalGates({
+              workdir,
+              diffFiles: changedFiles,
+              failedFiles,
+              verify,
+              tsconfigAvailable: existsSync(join(workdir, 'tsconfig.json')),
+            })
+            stats.gates = gates
+            const hardFail = gates.filter(g => !g.ok && !g.detail.includes('warn-level'))
+            if (hardFail.length > 0 && t2.ok) {
+              rounds[gen] += ` | 机械门FAIL: ${hardFail.map(g => g.name).join(',')}`
+              mechanicalGateBlock = true
+            }
             if (t2.ok) {
               fixed = true
               prevPassed = true
@@ -972,7 +1128,7 @@ ${t.out.slice(-1500)}
               rounds[gen] += g.log
               stats.review = { degraded: g.degraded, channel: g.channel }
               if (g.converged) {
-                const rc = resolveConvergence(g, piFail, gen, review.danger)
+                const rc = resolveConvergence(g, piFail, gen, review.danger, mechanicalGateBlock)
                 converged = rc.converged
                 finalState = rc.finalState
                 break
@@ -1005,7 +1161,7 @@ ${t.out.slice(-1500)}
         rounds[gen] += g.log
         stats.review = { degraded: g.degraded, channel: g.channel }
         if (g.converged) {
-          const rc = resolveConvergence(g, piFail, gen, review.danger)
+          const rc = resolveConvergence(g, piFail, gen, review.danger, mechanicalGateBlock)
           converged = rc.converged
           finalState = rc.finalState
           break
