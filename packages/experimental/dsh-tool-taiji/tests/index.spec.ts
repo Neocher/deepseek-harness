@@ -18,6 +18,7 @@ import {
   extractJsonObject,
   bidJitter,
   fnv1a,
+  auction,
   failedFilesFromOutput,
   getChangedFiles,
   hasRelevantChange,
@@ -708,5 +709,48 @@ describe('P1-7 主循环接线', () => {
     expect(src).toContain('stats.ecosystem = ecoInfo.eco')
     expect(src).toContain('genAcceptanceTest(goal, workdir, ecoInfo)')
     expect(src).toContain('verifyWithAcceptance(verify, acceptPath, workdir, ecoInfo)')
+  })
+})
+
+/** P1-①: auction excludeFiles 多目标选择 (agent 打不同靶) */
+describe('P1-① auction excludeFiles 多目标选择', () => {
+  /** 三文件信息素地图: A(Pe=90) > B(Pe=60) > C(Pe=30), 刺激 = Pe (Pr=0)。 */
+  const mkPm = (): Record<string, { Pe: number; Pr: number; complexity: number }> => ({
+    'a.py': { Pe: 90, Pr: 0, complexity: 0 },
+    'b.py': { Pe: 60, Pr: 0, complexity: 0 },
+    'c.py': { Pe: 30, Pr: 0, complexity: 0 },
+  })
+
+  it('AC-1: 空 excludeFiles 与无参结果一致 (向后兼容回归)', () => {
+    const pm = mkPm()
+    const withEmpty = auction(pm, td, 1, () => {}, [])
+    const without = auction(pm, td, 1, () => {})
+    expect(withEmpty).toEqual(without)
+    expect(withEmpty?.file).toBe('a.py')
+  })
+
+  it('AC-2: 排除 argmax 取次优 (守卫 && 优先级)', () => {
+    const pm = mkPm()
+    expect(auction(pm, td, 1, () => {}, ['a.py'])?.file).toBe('b.py')
+    expect(auction(pm, td, 1, () => {}, ['a.py', 'b.py'])?.file).toBe('c.py')
+  })
+
+  it('AC-3: 排除所有候选 → undefined (降级到无候选)', () => {
+    const pm = mkPm()
+    expect(auction(pm, td, 1, () => {}, ['a.py', 'b.py', 'c.py'])).toBeUndefined()
+  })
+
+  it('AC-4: 主循环 activeFile/usedFiles 换靶接线 (结构断言)', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('export function auction(')
+    expect(src).toContain('excludeFiles?: string[]')
+    expect(src).toContain('let activeFile = target.file')
+    expect(src).toContain('const usedFiles: string[] = []')
+    expect(src).toContain('auction(pm, workdir, gen, warn, usedFiles)')
+    expect(src).toContain('换靶: ${activeFile} (多目标)')
+    expect(src).toContain('resolvePrNote(pm, activeFile)')
+    expect(src).toContain("const taskDesc = `${activeFile === '__project__'")
+    // failedFilesFromOutput 仍读 baseline t.out (P0-⑥ 零变更门锚点不变)
+    expect(src).toContain('const failedFiles = failedFilesFromOutput(t.out)')
   })
 })

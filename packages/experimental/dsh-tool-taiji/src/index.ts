@@ -187,16 +187,24 @@ export function bidJitter(seed: string): number {
 
 /** 高斯响应竞标: 每个 agent 有专长刺激区间, 概率微扰后排序 (降序)
  * 4.0 演进: 竞标分 × 信誉权重 (经验引导派单, 修复连续失败者权重下降,
- * 其它通道自动上位 — 修复通道从 claude 独占扩展为权重自动派单)。 */
-function auction(
+ * 其它通道自动上位 — 修复通道从 claude 独占扩展为权重自动派单)。
+ * P1-①: 多目标选择 — excludeFiles 排除已用文件后取 argmax 次优 (单候选自动降级)。
+ * @param pm 信息素地图 (Pe/Pr 双态刺激)
+ * @param workdir 工作目录 (读 agent 权重)
+ * @param gen 当前代数 (进竞标微扰种子)
+ * @param warn 落盘告警回调 (缺省 console.warn)
+ * @param excludeFiles 排除的文件集 (多目标换靶时传前 N-1 个 agent 已用文件)
+ * @returns 竞标选中的文件 + 排序后的 agent 列表 + 刺激值; 无候选返回 undefined */
+export function auction(
   pm: PheromoneMap,
   workdir: string,
   gen: number,
   warn: WarnFn = console.warn,
+  excludeFiles?: string[],
 ): { file: string; agents: string[]; stimulus: number } | undefined {
   const candidates: string[] = []
   for (const [file, node] of Object.entries(pm)) {
-    if (node.Pe > 0 || node.Pr > 0) candidates.push(file)
+    if ((node.Pe > 0 || node.Pr > 0) && !(excludeFiles ?? []).includes(file)) candidates.push(file)
   }
   if (candidates.length === 0) return undefined
   const file = candidates.reduce((a, b) =>
@@ -1186,9 +1194,9 @@ async function taijiRunInner(
       } else {
         const target = auction(pm, workdir, gen, warn)
         if (target) {
-          const note = resolvePrNote(pm, target.file)
-          const ctxNote = note ? `\n评审提示: ${note}` : ''
-          const taskDesc = `${target.file === '__project__' ? '项目整体' : target.file}`
+          // P1-①: 多目标选择 — 第 N 个 agent 排除前 N-1 个 agent 已用文件, 打不同靶
+          const usedFiles: string[] = []
+          let activeFile = target.file
           let fixed = false
           let t2: { ok: boolean; out: string; code: number } | undefined
           for (const agent of target.agents) {
@@ -1197,6 +1205,17 @@ async function taijiRunInner(
               rounds[gen] += ` | 无 provider: ${agent}`
               continue
             }
+            // 第 2+ 个 agent: 换靶 (排除前面用过的文件); 无替代文件时降级打同文件
+            if (usedFiles.length > 0) {
+              const alt = auction(pm, workdir, gen, warn, usedFiles)
+              if (alt && alt.file !== activeFile) {
+                activeFile = alt.file
+                rounds[gen] += ` | ${agent} 换靶: ${activeFile} (多目标)`
+              }
+            }
+            const note = resolvePrNote(pm, activeFile)
+            const ctxNote = note ? `\n评审提示: ${note}` : ''
+            const taskDesc = `${activeFile === '__project__' ? '项目整体' : activeFile}`
             const r = await delegate(
               ctx,
               provider,
@@ -1243,10 +1262,12 @@ ${t.out.slice(-1500)}
               mechanicalGateBlock = true
             }
             if (t2.ok) {
+              usedFiles.push(activeFile)
               fixed = true
               prevPassed = true
               break
             }
+            usedFiles.push(activeFile)
             prevPassed = false
             signal.throwIfAborted()
           }
