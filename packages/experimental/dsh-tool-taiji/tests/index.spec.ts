@@ -23,6 +23,8 @@ import {
   hasRelevantChange,
   isFailClosed,
   resolveConvergence,
+  resolvePrNote,
+  setProjectNote,
 } from '../src/index.js'
 
 let td: string
@@ -363,5 +365,44 @@ describe('P0-6 resolveConvergence 收敛决策', () => {
       expect(block).toContain('break')
       expect(block).not.toContain('[复审FAIL]')
     }
+  })
+})
+
+/** P1-2: Pr_note 写读键断链修复 */
+describe('P1-2 Pr_note 写读键断链', () => {
+  it('setProjectNote 保留累计 Pe/Pr; 首次 (零值) 应用 base; base 缺省不改变零值 (AC-1/AC-2)', () => {
+    const kept = setProjectNote(
+      { __project__: { Pe: 20, Pr: 10, complexity: 30 } },
+      'note',
+      { Pe: 30, Pr: 20 },
+    )
+    expect(kept.__project__?.Pe).toBe(20)
+    expect(kept.__project__?.Pr).toBe(10)
+    expect(kept.__project__?.Pr_note).toBe('note')
+
+    const withBase = setProjectNote({}, 'note', { Pe: 30, Pr: 20 })
+    expect(withBase.__project__?.Pe).toBe(30)
+    expect(withBase.__project__?.Pr).toBe(20)
+    expect(withBase.__project__?.Pr_note).toBe('note')
+
+    const noBase = setProjectNote({}, 'note')
+    expect(noBase.__project__?.Pe).toBe(0)
+    expect(noBase.__project__?.Pr).toBe(0)
+    expect(noBase.__project__?.complexity).toBe(30)
+    expect(noBase.__project__?.Pr_note).toBe('note')
+  })
+  it('读端 fallback: 文件无 note + __project__ 有 note → 命中全局 (AC-3)', () => {
+    const pm = {
+      foo: { Pe: 0, Pr: 0, complexity: 0 },
+      __project__: { Pe: 0, Pr: 0, complexity: 30, Pr_note: 'G' },
+    }
+    expect(resolvePrNote(pm, 'foo')).toBe('G')
+  })
+  it('读端优先级: 文件自身有 note → 用文件的不用全局 (AC-4)', () => {
+    const pm = {
+      foo: { Pe: 0, Pr: 0, complexity: 0, Pr_note: 'F' },
+      __project__: { Pe: 0, Pr: 0, complexity: 30, Pr_note: 'G' },
+    }
+    expect(resolvePrNote(pm, 'foo')).toBe('F')
   })
 })

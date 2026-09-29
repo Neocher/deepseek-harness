@@ -359,6 +359,31 @@ export function hasRelevantChange(changedFiles: string[], failedFiles: string[])
   return changedFiles.some(cf => failedFiles.some(ff => cf.includes(ff) || ff.includes(cf)))
 }
 
+/** 读端评审意见解析 (P1-②): 优先本文件 Pr_note; 无则回退 __project__ 全局评审意见。
+ * @param pm 信息素地图
+ * @param file 竞标选中的目标文件
+ * @returns 文件自身 note 命中即返回; file 为 __project__ 时返回其自身 note (undefined 即无);
+ * 否则回退 __project__ 的 Pr_note, 均无返回 undefined */
+export function resolvePrNote(pm: PheromoneMap, file: string): string | undefined {
+  const fileNote = pm[file]?.Pr_note
+  if (fileNote) return fileNote
+  if (file === '__project__') return undefined
+  return pm['__project__']?.Pr_note
+}
+
+/** 项目级评审意见写入 (P1-②): 保留 __project__ 既有 Pe/Pr (不擦除 sprayWeighted 累计),
+ * 仅 fresh (Pe===0 && Pr===0) 时应用 base 基础刺激, 始终覆盖 Pr_note。
+ * @param pm 信息素地图
+ * @param note 评审意见文本
+ * @param base 首次写入的基础刺激 (Pe/Pr), 缺省时不改变零值
+ * @returns 更新 __project__ 节点后的新信息素地图 */
+export function setProjectNote(pm: PheromoneMap, note: string, base?: { Pe: number; Pr: number }): PheromoneMap {
+  const prev = pm['__project__'] ?? { Pe: 0, Pr: 0, complexity: 30 }
+  const fresh = prev.Pe === 0 && prev.Pr === 0
+  const merged = fresh && base ? { ...prev, ...base } : { ...prev }
+  return { ...pm, __project__: { ...merged, complexity: merged.complexity ?? 30, Pr_note: note } }
+}
+
 /** 通过 subagents 调度一个子智能体, 返回其输出文本
  * claude-code 走 CLI 直调 (SDK 经 opencodex 桥返回 invalid-result, 2026-09-01 实测;
  * CLI 直调 --allowedTools Edit Write --add-dir 已验证可写目标目录)。 */
@@ -883,7 +908,7 @@ async function taijiRunInner(
       } else {
         const target = auction(pm, workdir, gen, warn)
         if (target) {
-          const note = pm[target.file]?.Pr_note
+          const note = resolvePrNote(pm, target.file)
           const ctxNote = note ? `\n评审提示: ${note}` : ''
           const taskDesc = `${target.file === '__project__' ? '项目整体' : target.file}`
           let fixed = false
@@ -957,11 +982,11 @@ ${t.out.slice(-1500)}
                 break
               }
               // 真实 FAIL (任意可用通道) → 回灌信息素
-              pm = { ...pm, __project__: { Pe: 30, Pr: 20, complexity: 30, Pr_note: `[复审FAIL] ${g.summary.slice(0, 300)}` } }
+              pm = setProjectNote(pm, `[复审FAIL] ${g.summary.slice(0, 300)}`, { Pe: 30, Pr: 20 })
               savePheromones(workdir, pm)
             } else {
               // danger 过高 (pi 通道正常) → 喷洒评审意见
-              pm = { ...pm, __project__: { Pe: 0, Pr: 20, complexity: 30, Pr_note: review.suggestions.slice(0, 300) } }
+              pm = setProjectNote(pm, review.suggestions.slice(0, 300), { Pe: 0, Pr: 20 })
               savePheromones(workdir, pm)
             }
           }
@@ -989,11 +1014,11 @@ ${t.out.slice(-1500)}
           finalState = g.finalState
           break
         }
-        pm = { ...pm, __project__: { Pe: 30, Pr: 20, complexity: 30, Pr_note: `[复审FAIL] ${g.summary.slice(0, 300)}` } }
+        pm = setProjectNote(pm, `[复审FAIL] ${g.summary.slice(0, 300)}`, { Pe: 30, Pr: 20 })
         savePheromones(workdir, pm)
       } else {
         // danger 过高 (pi 正常) → 喷洒意见并继续 (防静默空转), 由修复通道处理
-        pm = { ...pm, __project__: { Pe: 30, Pr: 20, complexity: 30, Pr_note: review.suggestions.slice(0, 300) } }
+        pm = setProjectNote(pm, review.suggestions.slice(0, 300), { Pe: 30, Pr: 20 })
         savePheromones(workdir, pm)
       }
     }
