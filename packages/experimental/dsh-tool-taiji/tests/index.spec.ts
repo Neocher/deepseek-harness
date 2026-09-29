@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync, mkdirSync, statSync, utimesSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
@@ -28,6 +28,10 @@ import {
   resolvePrNote,
   setProjectNote,
   buildEvidence,
+  probeEcosystem,
+  tsAcceptanceBody,
+  genAcceptanceTest,
+  verifyWithAcceptance,
 } from '../src/index.js'
 
 let td: string
@@ -560,5 +564,149 @@ describe('P1-D 收敛证据链', () => {
     expect(src).toContain('lastGates = gates')
     expect(src).toContain('evidence: evidence ?? null')
     expect(src).toContain('r.evidence ?? null')
+  })
+})
+
+/** P1-7: 生态探测 + auto_tdd 生态化 */
+describe('P1-7 probeEcosystem 生态探测', () => {
+  it('pnpm-lock.yaml → node/pnpm + defaultVerify pnpm test', () => {
+    writeFileSync(join(td, 'pnpm-lock.yaml'), '')
+    expect(probeEcosystem(td)).toEqual({ eco: 'node', pkgManager: 'pnpm', defaultVerify: 'pnpm test' })
+  })
+  it('yarn.lock → node/yarn', () => {
+    writeFileSync(join(td, 'yarn.lock'), '')
+    expect(probeEcosystem(td)).toEqual({ eco: 'node', pkgManager: 'yarn', defaultVerify: 'yarn test' })
+  })
+  it('package-lock.json → node/npm', () => {
+    writeFileSync(join(td, 'package-lock.json'), '')
+    expect(probeEcosystem(td)).toEqual({ eco: 'node', pkgManager: 'npm', defaultVerify: 'npm test' })
+  })
+  it('pyproject.toml → python/pytest -q', () => {
+    writeFileSync(join(td, 'pyproject.toml'), '')
+    expect(probeEcosystem(td)).toEqual({ eco: 'python', defaultVerify: 'pytest -q' })
+  })
+  it('requirements.txt → python', () => {
+    writeFileSync(join(td, 'requirements.txt'), '')
+    expect(probeEcosystem(td).eco).toBe('python')
+  })
+  it('setup.py → python', () => {
+    writeFileSync(join(td, 'setup.py'), '')
+    expect(probeEcosystem(td).eco).toBe('python')
+  })
+  it('无文件 → none + echo', () => {
+    expect(probeEcosystem(td)).toEqual({ eco: 'none', defaultVerify: 'echo "no ecosystem"' })
+  })
+  it('多 lockfile 并存 pnpm 优先', () => {
+    writeFileSync(join(td, 'package-lock.json'), '')
+    writeFileSync(join(td, 'yarn.lock'), '')
+    writeFileSync(join(td, 'pnpm-lock.yaml'), '')
+    expect(probeEcosystem(td).pkgManager).toBe('pnpm')
+  })
+  it('node lockfile 与 python 文件并存 → node', () => {
+    writeFileSync(join(td, 'package-lock.json'), '')
+    writeFileSync(join(td, 'pyproject.toml'), '')
+    expect(probeEcosystem(td).eco).toBe('node')
+  })
+})
+
+/** P1-7: tsAcceptanceBody TS 验收模板 */
+describe('P1-7 tsAcceptanceBody TS 验收模板', () => {
+  it('含 module 文件名 + existsSync 断言 + node:fs/node:path 导入', () => {
+    const body = tsAcceptanceBody('实现 foo 模块', 'foo')
+    expect(body).toContain("'foo.ts'")
+    expect(body).toContain('existsSync')
+    expect(body).toContain("from 'node:fs'")
+    expect(body).toContain("from 'node:path'")
+    expect(body).toContain('describe(')
+  })
+  it('不虚构 import 目标模块 (只导入 node 内置)', () => {
+    const body = tsAcceptanceBody('实现 foo 模块', 'foo')
+    expect(body).not.toContain('import foo')
+    expect(body).not.toContain("from 'foo'")
+    expect(body).toMatch(/import \{ existsSync \} from 'node:fs'/)
+  })
+})
+
+/** P1-7: genAcceptanceTest 生态化 */
+describe('P1-7 genAcceptanceTest 生态化', () => {
+  it('node 生态 (pnpm-lock) 生成 .test.ts 而非 .py', () => {
+    writeFileSync(join(td, 'pnpm-lock.yaml'), '')
+    const path = genAcceptanceTest('实现 foo 模块', td)
+    expect(path).toContain('test_acceptance.test.ts')
+    expect(path).not.toContain('test_acceptance.py')
+    expect(existsSync(path)).toBe(true)
+    expect(readFileSync(path, 'utf-8')).toContain('existsSync')
+  })
+  it('显式传 eco=node 即使无 lockfile 也生成 .test.ts', () => {
+    const path = genAcceptanceTest('实现 foo 模块', td, { eco: 'node', pkgManager: 'pnpm', defaultVerify: 'pnpm test' })
+    expect(path).toContain('test_acceptance.test.ts')
+  })
+  it('eco=ts 走 .test.ts 分支 (类型前瞻)', () => {
+    const path = genAcceptanceTest('实现 foo 模块', td, { eco: 'ts', defaultVerify: 'pnpm test' })
+    expect(path).toContain('test_acceptance.test.ts')
+  })
+  it('python 生态 (pyproject) 生成 .py + acceptanceBody 字节级不变', () => {
+    writeFileSync(join(td, 'pyproject.toml'), '')
+    const path = genAcceptanceTest('实现 foo 模块', td)
+    expect(path).toContain('test_acceptance.py')
+    const body = readFileSync(path, 'utf-8')
+    expect(body).toContain('import foo')
+    expect(body).toContain('def test_foo()')
+    expect(body).toContain('hasattr(foo, "foo")')
+  })
+  it('TS 幂等: 内容一致不重写 (mtime 不被写操作覆盖)', () => {
+    writeFileSync(join(td, 'pnpm-lock.yaml'), '')
+    const p = genAcceptanceTest('实现 foo 模块', td)
+    const past = new Date('2000-01-01T00:00:00Z')
+    utimesSync(p, past, past)   // 回拨 mtime 到已知旧值, 消除对时钟/延时的依赖
+    const mAfterSet = statSync(p).mtimeMs
+    const p2 = genAcceptanceTest('实现 foo 模块', td)   // 内容一致 → 跳过写
+    expect(p2).toBe(p)
+    expect(statSync(p).mtimeMs).toBe(mAfterSet)   // 写操作未覆盖 mtime
+  })
+  it('TS 内容被篡改 → 重写恢复', () => {
+    writeFileSync(join(td, 'pnpm-lock.yaml'), '')
+    const p = genAcceptanceTest('实现 foo 模块', td)
+    const correct = readFileSync(p, 'utf-8')
+    writeFileSync(p, 'garbage')
+    genAcceptanceTest('实现 foo 模块', td)
+    expect(readFileSync(p, 'utf-8')).toBe(correct)
+  })
+})
+
+/** P1-7: verifyWithAcceptance 生态化 */
+describe('P1-7 verifyWithAcceptance 生态化', () => {
+  const tsPath = () => join(td, '.taiji', 'test_acceptance.test.ts')
+  const pyPath = () => join(td, '.taiji', 'test_acceptance.py')
+
+  it('vitest verify + .test.ts → --run', () => {
+    const v = verifyWithAcceptance('npx vitest', tsPath(), td, { eco: 'node', pkgManager: 'pnpm', defaultVerify: 'pnpm test' })
+    expect(v).toBe('npx vitest --run .taiji/test_acceptance.test.ts')
+  })
+  it('jest verify → 保留原 verify 前缀追加路径', () => {
+    expect(verifyWithAcceptance('npx jest', tsPath(), td, { eco: 'node', pkgManager: 'npm', defaultVerify: 'npm test' }))
+      .toBe('npx jest .taiji/test_acceptance.test.ts')
+    expect(verifyWithAcceptance('npx jest --coverage', tsPath(), td, { eco: 'node', pkgManager: 'npm', defaultVerify: 'npm test' }))
+      .toBe('npx jest --coverage .taiji/test_acceptance.test.ts')
+  })
+  it('其余 node verify → 直接追加路径 (单命令无 &&, 免 shell 可跑)', () => {
+    const v = verifyWithAcceptance('pnpm test', tsPath(), td, { eco: 'node', pkgManager: 'pnpm', defaultVerify: 'pnpm test' })
+    expect(v).toBe('pnpm test .taiji/test_acceptance.test.ts')
+  })
+  it('pytest 系路径不变 (回归保护)', () => {
+    expect(verifyWithAcceptance('pytest -q', pyPath(), td)).toBe('pytest -q .taiji/test_acceptance.py')
+    expect(verifyWithAcceptance('npm test', pyPath(), td)).toBe('pytest -q .taiji/test_acceptance.py && npm test')
+  })
+})
+
+/** P1-7: 主循环接线 (结构断言) */
+describe('P1-7 主循环接线', () => {
+  it('probeEcosystem + defaultVerify + stats.ecosystem + ecoInfo 透传', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('const ecoInfo = probeEcosystem(workdir)')
+    expect(src).toContain('let verify = args.verify || ecoInfo.defaultVerify')
+    expect(src).toContain('stats.ecosystem = ecoInfo.eco')
+    expect(src).toContain('genAcceptanceTest(goal, workdir, ecoInfo)')
+    expect(src).toContain('verifyWithAcceptance(verify, acceptPath, workdir, ecoInfo)')
   })
 })

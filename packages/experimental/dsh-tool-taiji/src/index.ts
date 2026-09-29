@@ -564,6 +564,66 @@ export function acceptanceSymbolName(goal: string): string | undefined {
   return m ? m[1] : undefined
 }
 
+/** 工作目录生态 (P1-⑦): 只认 lockfile/配置文件存在性, 不读 package.json scripts 字段。
+ * 'ts' 保留供类型前瞻 (probeEcosystem 永不产出 'ts', 只产出 node/python/none)。 */
+export type Ecosystem = 'python' | 'ts' | 'node' | 'none'
+
+/** 生态探测结果: eco 生态类别 + node 系 pkgManager + 缺省 verify 命令。 */
+export interface EcosystemInfo {
+  eco: Ecosystem
+  pkgManager?: 'pnpm' | 'yarn' | 'npm'
+  defaultVerify: string
+}
+
+/** 探测工作目录生态 (确定性, 只认 lockfile/配置文件存在性):
+ * pnpm-lock.yaml → pnpm / yarn.lock → yarn / package-lock.json → npm (优先级 pnpm > yarn > npm);
+ * requirements.txt / pyproject.toml / setup.py → python; 均无 → none。
+ * @param workdir 工作目录 (绝对路径)
+ * @returns 生态信息 (eco + pkgManager? + defaultVerify) */
+export function probeEcosystem(workdir: string): EcosystemInfo {
+  if (existsSync(join(workdir, 'pnpm-lock.yaml'))) {
+    return { eco: 'node', pkgManager: 'pnpm', defaultVerify: 'pnpm test' }
+  }
+  if (existsSync(join(workdir, 'yarn.lock'))) {
+    return { eco: 'node', pkgManager: 'yarn', defaultVerify: 'yarn test' }
+  }
+  if (existsSync(join(workdir, 'package-lock.json'))) {
+    return { eco: 'node', pkgManager: 'npm', defaultVerify: 'npm test' }
+  }
+  if (existsSync(join(workdir, 'requirements.txt'))
+    || existsSync(join(workdir, 'pyproject.toml'))
+    || existsSync(join(workdir, 'setup.py'))) {
+    return { eco: 'python', defaultVerify: 'pytest -q' }
+  }
+  return { eco: 'none', defaultVerify: 'echo "no ecosystem"' }
+}
+
+/** TS 生态验收测试模板 (确定性): 只断言目标模块文件存在 (existsSync), 不虚构 import
+ * 路径/符号约定 (与 Python 路径"不虚构人为约定"纪律一致; symbol 断言留待 P2 读 tsconfig paths)。
+ * 签名有意只收 goal/module 两参: spec 草案的 tokens/symbol 仅服务 TS 符号断言, 本分支
+ * 不做符号断言故不保留死参。
+ * @param goal 任务目标 (写入注释便于追溯)
+ * @param module 目标模块文件名 (与 Python 路径同一 module 名)
+ * @returns .test.ts 文件内容 */
+export function tsAcceptanceBody(goal: string, module: string): string {
+  return [
+    '// 自动验收测试 — 由 mission.goal 确定性生成 (无 LLM 模板)。',
+    '//',
+    `// goal: ${goal}`,
+    '// 作用: 功能新增类任务防假收敛 — 目标模块文件不存在时本测试失败, 使基线变红,',
+    '//      给信息素循环真实驱动信号; 文件落地后本测试转绿参与收敛判定。',
+    "import { existsSync } from 'node:fs'",
+    "import { resolve } from 'node:path'",
+    '',
+    "describe('auto acceptance (goal-derived)', () => {",
+    "  it('goal 要求的模块文件存在', () => {",
+    `    expect(existsSync(resolve(process.cwd(), '${module}.ts'))).toBe(true)`,
+    '  })',
+    '})',
+    '',
+  ].join('\n')
+}
+
 function acceptanceBody(goal: string, module: string, tokens: string[], symbol?: string): string {
   const names = tokens.length ? tokens.join('、') : module
   // 断言策略 (2026-09-14 修正): 有显式符号 → 断言该符号存在;
@@ -590,13 +650,20 @@ function acceptanceBody(goal: string, module: string, tokens: string[], symbol?:
   ].join('\n')
 }
 
-/** 生成 <workdir>/.taiji/test_acceptance.py (幂等: 内容一致不重写), 返回绝对路径。 */
-export function genAcceptanceTest(goal: string, workdir: string): string {
+/** 生成 <workdir>/.taiji/test_acceptance.{py|test.ts} (幂等: 内容一致不重写), 返回绝对路径。
+ * node/ts 生态生成 .test.ts (文件存在断言), python/none 生态生成 .py (行为字节级不变)。
+ * @param goal 任务目标
+ * @param workdir 工作目录
+ * @param eco 生态信息 (缺省时现场探测)
+ * @returns 验收测试文件绝对路径 */
+export function genAcceptanceTest(goal: string, workdir: string, eco?: EcosystemInfo): string {
   const tokens = acceptanceTokens(goal)
   const module = acceptanceIdent(acceptanceModuleName(goal) ?? tokens.join('_'))
   const symbol = acceptanceSymbolName(goal)
-  const body = acceptanceBody(goal, module, tokens, symbol)
-  const path = join(workdir, '.taiji', 'test_acceptance.py')
+  const info = eco ?? probeEcosystem(workdir)
+  const isTs = info.eco === 'ts' || info.eco === 'node'
+  const body = isTs ? tsAcceptanceBody(goal, module) : acceptanceBody(goal, module, tokens, symbol)
+  const path = join(workdir, '.taiji', isTs ? 'test_acceptance.test.ts' : 'test_acceptance.py')
   mkdirSync(dirname(path), { recursive: true })
   if (!existsSync(path) || readFileSync(path, 'utf8') !== body) {
     writeFileSync(path, body, 'utf8')
@@ -604,9 +671,24 @@ export function genAcceptanceTest(goal: string, workdir: string): string {
   return path
 }
 
-/** 把验收测试并入 verify: pytest 系直接追加路径; 否则前置独立 pytest + && 短路。 */
-export function verifyWithAcceptance(verify: string, acceptPath: string, workdir: string): string {
+/** 把验收测试并入 verify (P1-⑦ 生态化): pytest 系直接追加路径 (python 生态字节级不变);
+ * node/ts 生态 + .test.ts 文件 → vitest 追加 `--run` 单跑; 其余 node verify (jest 等) 直接
+ * 追加路径 (保留原 verify 前缀, 单命令、无 `&&`, 免 shell 模式可跑, 走宿主仓库自身 runner)。
+ * 追加的是相对 workdir 的路径 (rel), 与 pytest 分支一致 — runVerify 以 cwd=resolve(workdir)
+ * 执行, 相对路径正确解析。
+ * @param verify 原验收命令
+ * @param acceptPath 验收测试文件绝对路径
+ * @param workdir 工作目录
+ * @param eco 生态信息 (缺省时现场探测)
+ * @returns 拼接后的 verify 命令 */
+export function verifyWithAcceptance(verify: string, acceptPath: string, workdir: string, eco?: EcosystemInfo): string {
   const rel = relative(workdir, acceptPath)
+  const info = eco ?? probeEcosystem(workdir)
+  const isTsAccept = acceptPath.endsWith('.test.ts') && (info.eco === 'ts' || info.eco === 'node')
+  if (isTsAccept) {
+    if (verify.includes('vitest')) return `${verify} --run ${rel}`
+    return `${verify} ${rel}`
+  }
   return verify.includes('pytest') ? `${verify} ${rel}` : `pytest -q ${rel} && ${verify}`
 }
 
@@ -1031,7 +1113,8 @@ async function taijiRunInner(
 ): Promise<Record<string, unknown>> {
   const workdir = resolve(args.workdir)
   const warn: WarnFn = message => ctx.logger.warn(message)
-  let verify = args.verify || 'pytest -q'
+  const ecoInfo = probeEcosystem(workdir)
+  let verify = args.verify || ecoInfo.defaultVerify
   const maxRounds = args.rounds ?? MAX_ROUNDS_DEFAULT
   const goal = args.goal
   const dims = args.danger_dimensions
@@ -1044,6 +1127,7 @@ async function taijiRunInner(
   let converged = false
   let finalState = ''
   const stats: Record<string, unknown> = { sandbox, dims: dims ?? 'default' }
+  stats.ecosystem = ecoInfo.eco
   let piBroken = false   // pi 通道失败一次后本轮跳过 (不再每代付 2min 超时)
 
   // P1-D: 收敛证据链"最新一代"快照 (循环外声明, 同 mechanicalGateBlock; 运行期逐代更新)
@@ -1067,8 +1151,8 @@ async function taijiRunInner(
   if (autoTdd && ACCEPTANCE_INTENT_KEYWORDS.some(k => goal.includes(k))) {
     const base = await runVerify(verify, workdir)
     if (base.ok) {
-      const acceptPath = genAcceptanceTest(goal, workdir)
-      verify = verifyWithAcceptance(verify, acceptPath, workdir)
+      const acceptPath = genAcceptanceTest(goal, workdir, ecoInfo)
+      verify = verifyWithAcceptance(verify, acceptPath, workdir, ecoInfo)
       stats.tdd_injected = acceptPath
       stats.verify_effective = verify
     } else {
@@ -1326,7 +1410,7 @@ export function apply(ctx: Context): void {
       },
       verify: {
         type: 'string',
-        description: '验收命令, 默认 pytest -q。',
+        description: '验收命令, 缺省按生态探测 (node→<mgr> test, python→pytest -q, 无→echo)。',
       },
       rounds: {
         type: 'number',
