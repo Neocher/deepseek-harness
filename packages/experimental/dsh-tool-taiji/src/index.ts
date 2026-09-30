@@ -15,9 +15,10 @@ import { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, unlinkSync, statSync } from 'node:fs'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join, resolve, dirname, relative } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -77,6 +78,7 @@ export interface EffectiveParams {
   delegateTimeoutMs: number
   reviewChain: string
   autoTdd: boolean
+  parallel: string
   ecosystem?: string
 }
 
@@ -96,6 +98,7 @@ export function effectiveParams(): EffectiveParams {
     delegateTimeoutMs: Number(process.env.TAIJI_DELEGATE_TIMEOUT ?? 120_000),
     reviewChain: process.env.TAIJI_REVIEW_CHAIN ?? REVIEW_CHAIN_DEFAULT,
     autoTdd: process.env.TAIJI_AUTO_TDD !== '0',
+    parallel: process.env.TAIJI_PARALLEL === '0' ? '0' : '1',
   }
 }
 
@@ -736,6 +739,201 @@ export async function getChangedFiles(workdir: string): Promise<string[]> {
   } catch {
     return []
   }
+}
+
+/** ── P2-③: 隔离并行 B — 真 worktree 隔离 + 择优 ────────────────────────────
+ * 用 git worktree 为前 2 个 agent 各自隔离工作树并行 delegate+verify,
+ * 择优回写胜者文件到主 workdir 并复测; 失败 (建 wt 失败/双红/wt绿主红/未触发) 一律降级串行。 */
+
+/** 并行未触发/降级原因 (stats.parallel.fallback 取值)。 */
+export type ParallelFallback = 'non-git' | 'untracked' | 'disabled' | 'single-agent' | 'project-level'
+
+/** 单个 agent 的并行竞标结果 (ok = wt 内 delegate.ok && verify.ok; settledMs = 完成耗时)。 */
+export interface ParallelAgentResult {
+  agent: string
+  ok: boolean
+  settledMs: number
+}
+
+/** 并行观测快照: used=是否并行, winner=胜出 agent, losers=落败 agents, fallback=未并行原因。 */
+export interface ParallelStats {
+  used: boolean
+  winner?: string
+  losers?: string[]
+  fallback?: ParallelFallback
+}
+
+/** 为 agent 建隔离 worktree (git worktree add <tmpRoot>/taiji-<id> -b <branch> HEAD)。
+ * tmpRoot = /tmp/taiji-wt-<pid> (mkdir -p); 非 git 仓库或命令失败 → ok=false 不抛。
+ * @param workdir 主工作目录 (git 仓库根)
+ * @param id worktree 目录名后缀 (taiji-<id>)
+ * @param branch 新建分支名 (taiji/<gen>-<agent>-<ts>)
+ * @returns {ok, path, out} — ok=false 时调用方降级串行 */
+export async function worktreeFor(
+  workdir: string,
+  id: string,
+  branch: string,
+): Promise<{ ok: boolean; path: string; out: string }> {
+  const tmpRoot = join(tmpdir(), `taiji-wt-${process.pid}`)
+  const path = join(tmpRoot, `taiji-${id}`)
+  try {
+    mkdirSync(tmpRoot, { recursive: true })
+    const { stdout, stderr } = await execFileAsync('git', ['worktree', 'add', path, '-b', branch, 'HEAD'], {
+      cwd: resolve(workdir),
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    })
+    return { ok: true, path, out: stdout + stderr }
+  } catch (e) {
+    const p = execErrProps(e)
+    return { ok: false, path, out: p.stdout + p.stderr + p.message }
+  }
+}
+
+/** 清理 worktree + 分支 (fire-and-forget, 失败 console.warn 不抛; finally 必调防堆积)。
+ * @param workdir 主工作目录 (git 仓库根)
+ * @param path worktree 绝对路径
+ * @param branch worktree 对应分支名 */
+export function worktreeRemove(workdir: string, path: string, branch: string): void {
+  try {
+    execFileSync('git', ['worktree', 'remove', '--force', path], {
+      cwd: resolve(workdir), timeout: 30_000, stdio: 'ignore',
+    })
+  } catch (e) {
+    console.warn(`[taiji] worktree remove 失败: ${String(e)}`)
+  }
+  try {
+    execFileSync('git', ['branch', '-D', branch], {
+      cwd: resolve(workdir), timeout: 30_000, stdio: 'ignore',
+    })
+  } catch (e) {
+    console.warn(`[taiji] branch 删除失败: ${String(e)}`)
+  }
+}
+
+/** 择优回写: 读 wt 工作树文件写入主 workdir (不切分支)。
+ * agent 在 wt 内不 commit (delegate 只发 Edit/Write), 故不能用 `git show HEAD:<file>`
+ * (只会返回修复前旧内容); 读 wt 工作树文件等价实现"回写修复后的文件"。文件不存在 → ok=false。
+ * @param workdir 主工作目录
+ * @param wtPath worktree 绝对路径
+ * @param file 相对路径的目标文件
+ * @returns {ok, out} */
+export async function checkoutFromWorktree(
+  workdir: string,
+  wtPath: string,
+  file: string,
+): Promise<{ ok: boolean; out: string }> {
+  const src = join(wtPath, file)
+  if (!existsSync(src)) return { ok: false, out: `worktree 中无此文件: ${file}` }
+  try {
+    const content = await readFile(src, 'utf-8')
+    const dst = join(workdir, file)
+    mkdirSync(dirname(dst), { recursive: true })
+    await writeFile(dst, content, 'utf-8')
+    return { ok: true, out: '' }
+  } catch (e) {
+    return { ok: false, out: String(e) }
+  }
+}
+
+/** 并行择优 (纯函数): 恰一个绿 → 该 agent 胜出; 双绿 → settledMs 最小者胜出; 双红 → null。
+ * @param results 各 agent 的 {agent, ok, settledMs}
+ * @returns 胜出者或 null (无人胜出) */
+export function pickWinner(results: ParallelAgentResult[]): ParallelAgentResult | null {
+  const greens = results.filter(r => r.ok)
+  if (greens.length === 0) return null
+  if (greens.length === 1) return greens[0] ?? null
+  return greens.reduce((a, b) => (a.settledMs <= b.settledMs ? a : b))
+}
+
+/** 并行降级原因判定 (纯函数): disabled → single-agent → project-level → non-git → untracked → undefined。
+ * 全满足返回 undefined (走并行)。
+ * @param parallelEnabled TAIJI_PARALLEL 是否非 '0'
+ * @param agentCount 竞标 agent 数
+ * @param file 竞标选中的目标文件
+ * @param gitTrack git 追踪状态
+ * @returns 降级原因或 undefined (可并行) */
+export function parallelFallbackReason(
+  parallelEnabled: boolean,
+  agentCount: number,
+  file: string,
+  gitTrack: 'tracked' | 'non-git' | 'untracked',
+): ParallelFallback | undefined {
+  if (!parallelEnabled) return 'disabled'
+  if (agentCount < 2) return 'single-agent'
+  if (file === '__project__') return 'project-level'
+  if (gitTrack === 'non-git') return 'non-git'
+  if (gitTrack === 'untracked') return 'untracked'
+  return undefined
+}
+
+/** git 追踪状态一次判 (内部, 不导出): `git ls-files --error-unmatch -- <file>`。
+ * stderr 含 'not a git repository' → non-git; 其余非零退出 (pathspec 未匹配) → untracked。 */
+async function gitTrackStatus(workdir: string, file: string): Promise<'tracked' | 'non-git' | 'untracked'> {
+  try {
+    await execFileAsync('git', ['ls-files', '--error-unmatch', '--', file], {
+      cwd: resolve(workdir),
+      timeout: 10_000,
+      maxBuffer: 1024 * 1024,
+    })
+    return 'tracked'
+  } catch (e) {
+    const p = execErrProps(e)
+    return p.stderr.includes('not a git repository') ? 'non-git' : 'untracked'
+  }
+}
+
+/** 并行委派 + verify (前 2 agent 各在 wt 内并行), 按固定下标返回 {agent, ok, settledMs}。
+ * delegate/runVerify 为注入回调 (生产绑定 ctx/parent/signal/sandbox/prompt/verify; 单测传 mock 断言 workdir)。
+ * @param params agents (含 path)/注入 delegate + runVerify
+ * @returns 按下标对齐的并行结果 (ok = delegate.ok && verify.ok; settledMs 取公共起点到完成耗时) */
+export async function parallelAttempt(params: {
+  agents: Array<{ agent: string; provider: string; path: string }>
+  delegate: (provider: string, label: string, workdir: string) => Promise<{ ok: boolean; out: string }>
+  runVerify: (workdir: string) => Promise<{ ok: boolean; out: string; code: number }>
+}): Promise<ParallelAgentResult[]> {
+  const results: ParallelAgentResult[] = params.agents.map(a => ({ agent: a.agent, ok: false, settledMs: 0 }))
+  const start = Date.now()
+  await Promise.allSettled(
+    params.agents.map((a, i) => (async () => {
+      const r = await params.delegate(a.provider, `太极${a.agent}修复`, a.path)
+      const v = await params.runVerify(a.path)
+      results[i] = { agent: a.agent, ok: r.ok && v.ok, settledMs: Date.now() - start }
+    })()),
+  )
+  return results
+}
+
+/** 并行胜出的修复信号记录 (零变更门→权重→信誉→经验), 与串行同口径。
+ * 胜出 agent 记 win (weightDelta 走零变更门), 落败 agents 记 loss (weightDelta=0 仅信誉/经验)。
+ * 三个落盘函数为注入回调: 生产传真实实现, 单测传 mock 计数 (spec 判据 6)。
+ * @param params winner/losers/bucket/workdir/changedFiles/failedFiles/rOk/t2Ok/warn + 注入的落盘回调
+ * @returns {weightDelta, hasChange} 供调用方记录零变更门/机械门日志 */
+export function recordParallelSignals(params: {
+  winner: string
+  losers: string[]
+  bucket: string
+  workdir: string
+  changedFiles: string[]
+  failedFiles: string[]
+  rOk: boolean
+  t2Ok: boolean
+  warn: WarnFn
+  updateAgentWeight: (workdir: string, agent: string, delta: number, warn: WarnFn) => void
+  recordReputation: (agent: string, win: boolean, warn: WarnFn) => void
+  recordExperience: (bucket: string, agent: string, ok: boolean, warn: WarnFn) => void
+}): { weightDelta: number; hasChange: boolean } {
+  const { winner, losers, bucket, workdir, changedFiles, failedFiles, rOk, t2Ok, warn } = params
+  const hasChange = hasRelevantChange(changedFiles, failedFiles)
+  const weightDelta = hasChange ? agentWeightDelta(rOk, { ok: t2Ok }) : 0
+  params.updateAgentWeight(workdir, winner, weightDelta, warn)
+  params.recordReputation(winner, t2Ok && weightDelta > 0, warn)
+  params.recordExperience(bucket, winner, t2Ok && weightDelta > 0, warn)
+  for (const loser of losers) {
+    params.recordReputation(loser, false, warn)
+    params.recordExperience(bucket, loser, false, warn)
+  }
+  return { weightDelta, hasChange }
 }
 
 /** 双向 substring 相交判定: a 中任一路径与 b 中任一路径互相包含即命中
@@ -1531,12 +1729,13 @@ export function buildRunsRecord(input: {
   reputation: unknown
   experience?: unknown
   fingerprint: unknown
+  parallel?: unknown
   params: EffectiveParams
   evidence: unknown
 }): Record<string, unknown> {
   const {
     goal, workdir, verify, sandbox, dims, converged, finalState, rounds,
-    review, reputation, experience, fingerprint, params, evidence,
+    review, reputation, experience, fingerprint, parallel, params, evidence,
   } = input
   return {
     ts: Date.now(), goal, workdir, verify, sandbox, dims: dims ?? 'default',
@@ -1545,6 +1744,7 @@ export function buildRunsRecord(input: {
     reputation: reputation ?? null,
     experience: experience ?? null,
     fingerprint: fingerprint ?? null,
+    parallel: parallel ?? null,
     params,
     evidence: evidence ?? null,
   }
@@ -1610,6 +1810,7 @@ async function taijiRunInner(
   stats.ecosystem = ecoInfo.eco
   const fingerprint = taskFingerprint(goal, workdir)
   stats.fingerprint = fingerprint
+  stats.parallel = { used: false }
   let piBroken = false   // pi 通道失败一次后本轮跳过 (不再每代付 2min 超时)
 
   // P1-D: 收敛证据链"最新一代"快照 (循环外声明, 同 mechanicalGateBlock; 运行期逐代更新)
@@ -1675,7 +1876,113 @@ async function taijiRunInner(
           let activeFile = target.file
           let fixed = false
           let t2: { ok: boolean; out: string; code: number } | undefined
-          for (const agent of target.agents) {
+          // P2-③: 隔离并行 B — 触发条件全满足才并行, 否则原串行路径行为零变化
+          const parallelEnabled = process.env.TAIJI_PARALLEL !== '0'
+          const parallelEligible = parallelEnabled && target.agents.length >= 2 && activeFile !== '__project__'
+          const gitTrack = parallelEligible ? await gitTrackStatus(workdir, activeFile) : 'tracked'
+          const fallback = parallelFallbackReason(parallelEnabled, target.agents.length, activeFile, gitTrack)
+          stats.parallel = fallback === undefined ? { used: false } : { used: false, fallback }
+          let parallelStart = 0
+          let parallelFixed = false
+          if (fallback === undefined) {
+            const stamp = Date.now()
+            const note = resolvePrNote(pm, activeFile)
+            const ctxNote = note ? `\n评审提示: ${note}` : ''
+            const taskDesc = activeFile === '__project__' ? '项目整体' : activeFile
+            const wts: Array<{ agent: string; provider: string; branch: string; path: string }> = []
+            for (const agent of target.agents.slice(0, 2)) {
+              const provider = PROVIDER_BY_AGENT[agent]
+              if (!provider) break
+              const branch = `taiji/${gen}-${agent}-${stamp}`
+              const wt = await worktreeFor(workdir, `${gen}-${agent}`, branch)
+              if (!wt.ok) break
+              wts.push({ agent, provider, branch, path: wt.path })
+            }
+            if (wts.length < 2) {
+              for (const w of wts) worktreeRemove(workdir, w.path, w.branch)
+              rounds[gen] = (rounds[gen] ?? '') + ' | 并行: worktree 创建失败, 降级串行'
+              stats.parallel = { used: false }
+            } else {
+              try {
+                const prompt = `修复 ${taskDesc} 使验收命令 \`${verify}\` 通过。
+任务: ${goal.slice(0, 400)}
+${ctxNote}
+测试失败详情:
+${t.out.slice(-1500)}
+
+输出要求: 实际编辑文件完成修复。完成后报告改了什么。`
+                const results = await parallelAttempt({
+                  agents: wts.map(w => ({ agent: w.agent, provider: w.provider, path: w.path })),
+                  delegate: (provider, label, workdir) => delegate(ctx, provider, label, prompt, parent, signal, workdir, sandbox),
+                  runVerify: workdir => runVerify(verify, workdir),
+                })
+                const winner = pickWinner(results)
+                if (winner) {
+                  const winnerWt = wts.find(w => w.agent === winner.agent)
+                  const co = await checkoutFromWorktree(workdir, winnerWt?.path ?? '', activeFile)
+                  if (!co.ok) rounds[gen] = (rounds[gen] ?? '') + ` | 并行: 回写失败 (${co.out})`
+                  const t2main = await runVerify(verify, workdir)
+                  lastConvergedOut = t2main.out
+                  if (t2main.ok) {
+                    t2 = t2main
+                    rounds[gen] = (rounds[gen] ?? '') + ` | 并行: ${winner.agent}绿 → 胜出`
+                    const changedFiles = await getChangedFiles(workdir)
+                    const failedFiles = failedFilesFromOutput(t.out)
+                    const losers = wts.map(w => w.agent).filter(a => a !== winner.agent)
+                    const { hasChange } = recordParallelSignals({
+                      winner: winner.agent,
+                      losers,
+                      bucket: fingerprint.bucket,
+                      workdir,
+                      changedFiles,
+                      failedFiles,
+                      rOk: true,
+                      t2Ok: true,
+                      warn,
+                      updateAgentWeight,
+                      recordReputation,
+                      recordExperience,
+                    })
+                    if (!hasChange) rounds[gen] = (rounds[gen] ?? '') + ' | 零变更门: 无相关变更, 权重不增'
+                    const gates = await mechanicalGates({
+                      workdir,
+                      diffFiles: changedFiles,
+                      failedFiles,
+                      verify,
+                      tsconfigAvailable: existsSync(join(workdir, 'tsconfig.json')),
+                    })
+                    stats.gates = gates
+                    lastGates = gates
+                    const hardFail = gates.filter(g => !g.ok && !g.detail.includes('warn-level'))
+                    if (hardFail.length > 0) {
+                      rounds[gen] = (rounds[gen] ?? '') + ` | 机械门FAIL: ${hardFail.map(g => g.name).join(',')}`
+                      mechanicalGateBlock = true
+                    }
+                    usedFiles.push(activeFile)
+                    fixed = true
+                    prevPassed = true
+                    parallelFixed = true
+                    stats.parallel = { used: true, winner: winner.agent, losers }
+                  } else {
+                    t2 = t2main
+                    rounds[gen] = (rounds[gen] ?? '') + ' | 并行: 主workdir复测红 (wt绿主红)'
+                    usedFiles.push(activeFile)
+                    parallelStart = 2
+                    stats.parallel = { used: true, losers: results.map(x => x.agent) }
+                  }
+                } else {
+                  t2 = t
+                  rounds[gen] = (rounds[gen] ?? '') + ' | 并行: 双红 → 无人胜出'
+                  usedFiles.push(activeFile)
+                  parallelStart = 2
+                  stats.parallel = { used: true, losers: results.map(x => x.agent) }
+                }
+              } finally {
+                for (const w of wts) worktreeRemove(workdir, w.path, w.branch)
+              }
+            }
+          }
+          for (const agent of (parallelFixed ? [] : target.agents.slice(parallelStart))) {
             const provider = PROVIDER_BY_AGENT[agent]
             if (!provider) {
               rounds[gen] += ` | 无 provider: ${agent}`
@@ -1863,6 +2170,7 @@ ${t.out.slice(-1500)}
         reputation: stats.reputation,
         experience: stats.experience,
         fingerprint,
+        parallel: stats.parallel,
         params: effectiveParams(),
         evidence,
       }), null, 2),

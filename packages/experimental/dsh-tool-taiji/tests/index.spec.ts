@@ -51,6 +51,13 @@ import {
   recordExperience,
   applyExperience,
   expFactor,
+  worktreeFor,
+  worktreeRemove,
+  checkoutFromWorktree,
+  pickWinner,
+  parallelFallbackReason,
+  recordParallelSignals,
+  parallelAttempt,
 } from '../src/index.js'
 
 let td: string
@@ -72,6 +79,7 @@ afterEach(() => {
   delete process.env.TAIJI_DANGER_THRESHOLD
   delete process.env.TAIJI_SPRAY_FILE_PE
   delete process.env.TAIJI_AUTO_TDD
+  delete process.env.TAIJI_PARALLEL
 })
 
 /** C1: sandbox 分级 */
@@ -1278,5 +1286,165 @@ describe('P2-② 抽象经验库', () => {
     expect(rec.experience).toEqual({ bucket: 'fix:python', expFactor: 1.05 })
     const none = buildRunsRecord({ ...base })
     expect(none.experience).toBeNull()
+  })
+})
+
+/** P2-③: 隔离并行 B — 真 worktree 隔离 + 择优 */
+describe('P2-③ 隔离并行 worktree + 择优', () => {
+  /** 初始化一个含单个提交的 git 仓库 (worktreeFor 前置条件)。 */
+  const initRepo = (dir: string): void => {
+    execFileSync('git', ['init', '-q', dir])
+    execFileSync('git', ['-C', dir, 'config', 'user.email', 'test@example.com'])
+    execFileSync('git', ['-C', dir, 'config', 'user.name', 'Test'])
+    writeFileSync(join(dir, 'a.py'), 'v1\n')
+    execFileSync('git', ['-C', dir, 'add', 'a.py'])
+    execFileSync('git', ['-C', dir, 'commit', '-qm', 'init'])
+  }
+
+  it('worktreeFor: 真 git 仓库建 wt 成功 (目录+分支存在); 非 git → ok=false 不抛 (判据1)', async () => {
+    initRepo(td)
+    const ts = Date.now()
+    const branch = `taiji/wt-${ts}`
+    const wt = await worktreeFor(td, `wt-${ts}`, branch)
+    expect(wt.ok).toBe(true)
+    expect(existsSync(wt.path)).toBe(true)
+    const branches = execFileSync('git', ['-C', td, 'branch', '--list', branch], { encoding: 'utf-8' })
+    expect(branches).toContain(branch)
+    worktreeRemove(td, wt.path, branch)
+    expect(existsSync(wt.path)).toBe(false)
+
+    const nonGit = mkdtempSync(join(tmpdir(), 'taiji-nongit-'))
+    try {
+      const wt2 = await worktreeFor(nonGit, 'wt-nongit', 'taiji/x')
+      expect(wt2.ok).toBe(false)
+    } finally {
+      rmSync(nonGit, { recursive: true, force: true })
+    }
+  })
+
+  it('worktreeRemove 幂等: 删两次不抛 + 不堆积 (判据2)', async () => {
+    initRepo(td)
+    const ts = Date.now()
+    const branch = `taiji/rm-${ts}`
+    const wt = await worktreeFor(td, `rm-${ts}`, branch)
+    expect(wt.ok).toBe(true)
+    worktreeRemove(td, wt.path, branch)
+    expect(existsSync(wt.path)).toBe(false)
+    expect(() => { worktreeRemove(td, wt.path, branch) }).not.toThrow()
+    expect(existsSync(wt.path)).toBe(false)
+  })
+
+  it('checkoutFromWorktree: wt 内改动回写主 workdir + 文件不存在 ok=false (判据3)', async () => {
+    initRepo(td)
+    const ts = Date.now()
+    const branch = `taiji/co-${ts}`
+    const wt = await worktreeFor(td, `co-${ts}`, branch)
+    expect(wt.ok).toBe(true)
+    writeFileSync(join(wt.path, 'a.py'), 'fixed\n')
+    const co = await checkoutFromWorktree(td, wt.path, 'a.py')
+    expect(co.ok).toBe(true)
+    expect(readFileSync(join(td, 'a.py'), 'utf-8')).toBe('fixed\n')
+    const missing = await checkoutFromWorktree(td, wt.path, 'nope.py')
+    expect(missing.ok).toBe(false)
+    worktreeRemove(td, wt.path, branch)
+  })
+
+  it('pickWinner 三 case: 双绿先完成 / 单绿 / 双红 null (判据4)', () => {
+    expect(pickWinner([
+      { agent: 'a', ok: true, settledMs: 100 },
+      { agent: 'b', ok: true, settledMs: 50 },
+    ])?.agent).toBe('b')
+    expect(pickWinner([
+      { agent: 'a', ok: true, settledMs: 100 },
+      { agent: 'b', ok: false, settledMs: 50 },
+    ])?.agent).toBe('a')
+    expect(pickWinner([
+      { agent: 'a', ok: false, settledMs: 100 },
+      { agent: 'b', ok: false, settledMs: 50 },
+    ])).toBeNull()
+    expect(pickWinner([])).toBeNull()
+  })
+
+  it('parallelFallbackReason 降级五 case + 全满足 undefined (判据5)', () => {
+    expect(parallelFallbackReason(false, 2, 'a.py', 'tracked')).toBe('disabled')
+    expect(parallelFallbackReason(true, 1, 'a.py', 'tracked')).toBe('single-agent')
+    expect(parallelFallbackReason(true, 2, '__project__', 'tracked')).toBe('project-level')
+    expect(parallelFallbackReason(true, 2, 'a.py', 'non-git')).toBe('non-git')
+    expect(parallelFallbackReason(true, 2, 'a.py', 'untracked')).toBe('untracked')
+    expect(parallelFallbackReason(true, 2, 'a.py', 'tracked')).toBeUndefined()
+  })
+
+  it('effectiveParams().parallel 默认 1 + env TAIJI_PARALLEL=0 → 0 (判据7)', () => {
+    expect(effectiveParams().parallel).toBe('1')
+    process.env.TAIJI_PARALLEL = '0'
+    expect(effectiveParams().parallel).toBe('0')
+  })
+
+  it('recordParallelSignals: 胜出记 win, 落败记 loss (mock 计数, 判据6)', () => {
+    const updateAgentWeight = vi.fn()
+    const recordReputation = vi.fn()
+    const recordExperience = vi.fn()
+    const warn = vi.fn()
+    const r = recordParallelSignals({
+      winner: 'opencode',
+      losers: ['claude_code'],
+      bucket: 'fix:python',
+      workdir: td,
+      changedFiles: ['a.py'],
+      failedFiles: ['a.py'],
+      rOk: true,
+      t2Ok: true,
+      warn,
+      updateAgentWeight,
+      recordReputation,
+      recordExperience,
+    })
+    expect(r.weightDelta).toBe(1)
+    expect(r.hasChange).toBe(true)
+    expect(updateAgentWeight).toHaveBeenCalledWith(td, 'opencode', 1, warn)
+    expect(recordReputation).toHaveBeenCalledWith('opencode', true, warn)
+    expect(recordReputation).toHaveBeenCalledWith('claude_code', false, warn)
+    expect(recordExperience).toHaveBeenCalledWith('fix:python', 'opencode', true, warn)
+    expect(recordExperience).toHaveBeenCalledWith('fix:python', 'claude_code', false, warn)
+  })
+
+  it('parallelAttempt: delegate/runVerify 收到 wt.path (workdir 参数, 判据6)', async () => {
+    const delegate = vi.fn().mockResolvedValue({ ok: true, out: '' })
+    const runVerify = vi.fn().mockResolvedValue({ ok: true, out: '', code: 0 })
+    const results = await parallelAttempt({
+      agents: [
+        { agent: 'claude_code', provider: 'claude-code', path: '/tmp/taiji-wt-1' },
+        { agent: 'opencode', provider: 'opencode', path: '/tmp/taiji-wt-2' },
+      ],
+      delegate,
+      runVerify,
+    })
+    expect(results).toHaveLength(2)
+    expect(delegate).toHaveBeenCalledTimes(2)
+    expect(delegate).toHaveBeenCalledWith('claude-code', '太极claude_code修复', '/tmp/taiji-wt-1')
+    expect(delegate).toHaveBeenCalledWith('opencode', '太极opencode修复', '/tmp/taiji-wt-2')
+    expect(runVerify).toHaveBeenCalledTimes(2)
+    expect(runVerify).toHaveBeenCalledWith('/tmp/taiji-wt-1')
+    expect(runVerify).toHaveBeenCalledWith('/tmp/taiji-wt-2')
+    expect(results.every(x => x.ok)).toBe(true)
+  })
+
+  it('主循环接线 (结构断言): 并行分支 + stats.parallel + runs 落盘 (判据7)', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('export async function worktreeFor(')
+    expect(src).toContain('export function worktreeRemove(')
+    expect(src).toContain('export async function checkoutFromWorktree(')
+    expect(src).toContain('export function pickWinner(')
+    expect(src).toContain('export function parallelFallbackReason(')
+    expect(src).toContain('process.env.TAIJI_PARALLEL')
+    expect(src).toContain('Promise.allSettled(')
+    expect(src).toContain('pickWinner(results)')
+    expect(src).toContain('checkoutFromWorktree(workdir')
+    expect(src).toContain('worktreeFor(workdir')
+    expect(src).toContain('worktreeRemove(workdir')
+    expect(src).toContain('stats.parallel =')
+    expect(src).toContain('parallel: stats.parallel')
+    expect(src).toContain("parallel: process.env.TAIJI_PARALLEL === '0' ? '0' : '1'")
+    expect(src).toContain('target.agents.slice(parallelStart)')
   })
 })
