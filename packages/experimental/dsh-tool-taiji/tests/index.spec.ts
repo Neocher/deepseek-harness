@@ -44,6 +44,7 @@ import {
   applyReputation,
   repFactor,
   streakPenalty,
+  taskFingerprint,
 } from '../src/index.js'
 
 let td: string
@@ -987,6 +988,7 @@ describe('P1-③ 全局 agent 信誉库', () => {
       goal: 'g', workdir: '/w', verify: 'true', sandbox: 'full', dims: undefined,
       converged: false, finalState: '', rounds: { 1: 'x' },
       review: undefined, params: effectiveParams(), evidence: undefined,
+      fingerprint: undefined,
     }
     const rec = buildRunsRecord({
       ...base,
@@ -996,5 +998,80 @@ describe('P1-③ 全局 agent 信誉库', () => {
     // 无 reputation 时落 null (而非 undefined, 保证 JSON 序列化确定性)
     const none = buildRunsRecord({ ...base, reputation: undefined })
     expect(none.reputation).toBeNull()
+    expect(none.fingerprint).toBeNull()
+  })
+})
+
+/** P2-①: 任务指纹 (task fingerprint — 抽象经验库分桶前置, 纯确定性) */
+describe('P2-① 任务指纹', () => {
+  it('category 四类: 修复→fix / 添加→feature / 重构→refactor / 口语→unknown (判据1)', () => {
+    expect(taskFingerprint('修复 X', td).category).toBe('fix')
+    expect(taskFingerprint('添加 Y', td).category).toBe('feature')
+    expect(taskFingerprint('重构 Z', td).category).toBe('refactor')
+    expect(taskFingerprint('写个 hello world', td).category).toBe('unknown')
+  })
+
+  it('互斥优先级 fix>feature>refactor: 同时含修复+添加→fix (判据2)', () => {
+    expect(taskFingerprint('修复 X 并添加 Y', td).category).toBe('fix')
+    expect(taskFingerprint('添加 X 并重构 Y', td).category).toBe('feature')
+    expect(taskFingerprint('重构 X 并优化 Y', td).category).toBe('refactor')
+  })
+
+  it('大小写不敏感: "Fix the bug in auth" → fix (判据3)', () => {
+    expect(taskFingerprint('Fix the bug in auth', td).category).toBe('fix')
+  })
+
+  it('bucket 格式精确: fix:python / feature:node / unknown:none (判据4)', () => {
+    const py = join(td, 'py')
+    mkdirSync(py, { recursive: true })
+    writeFileSync(join(py, 'pyproject.toml'), '')
+    expect(taskFingerprint('修复 X', py).bucket).toBe('fix:python')
+
+    const node = join(td, 'node')
+    mkdirSync(node, { recursive: true })
+    writeFileSync(join(node, 'pnpm-lock.yaml'), '')
+    expect(taskFingerprint('添加 Y', node).bucket).toBe('feature:node')
+
+    expect(taskFingerprint('写个 hello world', td).bucket).toBe('unknown:none')
+  })
+
+  it('fp 格式精确 + 重放确定性: 同 goal 两次 deep-equal (判据5)', () => {
+    const a = taskFingerprint('修复 bug', td)
+    const b = taskFingerprint('修复 bug', td)
+    expect(a.fp).toBe('fix:none:修复 bug')
+    expect(b).toEqual(a)
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b))
+  })
+
+  it('长 goal 截断: 100 字 → fp 尾部 80 字符归一化 (判据6)', () => {
+    const long = 'x'.repeat(100)
+    expect(taskFingerprint(long, td).fp).toBe(`unknown:none:${'x'.repeat(80)}`)
+  })
+
+  it('eco 透传: pnpm-lock.yaml→node; 空目录→none (判据7)', () => {
+    writeFileSync(join(td, 'pnpm-lock.yaml'), '')
+    expect(taskFingerprint('修复 X', td).eco).toBe('node')
+    expect(taskFingerprint('修复 X', td).bucket).toBe('fix:node')
+    rmSync(join(td, 'pnpm-lock.yaml'))
+    expect(taskFingerprint('修复 X', td).eco).toBe('none')
+  })
+
+  it('goal 归一化进 fp: 全角空格/全角冒号/多空白压缩', () => {
+    expect(taskFingerprint('修复　bug：登录', td).fp).toBe('fix:none:修复 bug:登录')
+    expect(taskFingerprint('修复   bug', td).fp).toBe('fix:none:修复 bug')
+  })
+
+  it('空 goal → unknown + fp 尾空串 (不 crash)', () => {
+    const r = taskFingerprint('', td)
+    expect(r.category).toBe('unknown')
+    expect(r.fp).toBe('unknown:none:')
+  })
+
+  it('接线 (结构断言): stats.fingerprint + buildRunsRecord fingerprint 落盘 + 主循环调用', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('const fingerprint = taskFingerprint(goal, workdir)')
+    expect(src).toContain('stats.fingerprint = fingerprint')
+    expect(src).toContain('fingerprint: fingerprint ?? null')
+    expect(src).toContain('reputation: stats.reputation,')
   })
 })

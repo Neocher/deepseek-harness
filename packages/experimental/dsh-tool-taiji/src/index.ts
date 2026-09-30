@@ -811,6 +811,63 @@ export function probeEcosystem(workdir: string): EcosystemInfo {
   return { eco: 'none', defaultVerify: 'echo "no ecosystem"' }
 }
 
+/** P2-①: 任务指纹 (task fingerprint — 抽象经验库分桶前置, 纯确定性) ────────────
+ * category 用三张独立关键词表 (fix > feature > refactor, 先命中先停, 全不中 unknown),
+ * 与 auto_tdd 的 ACCEPTANCE_INTENT_KEYWORDS 独立不合并 (两用途各自演进);
+ * eco 复用 probeEcosystem(workdir).eco; fp 尾部 = normalizeGoal(goal)。 */
+const CATEGORY_FIX = ['修复', '修', 'fix', 'bug', '错误', '报错', '失败', '回归', 'regression', 'error']
+const CATEGORY_FEATURE = ['添加', '新增', '实现', '支持', '增加', '补', 'add', 'implement', 'support', 'new', 'feature']
+const CATEGORY_REFACTOR = ['重构', 'refactor', '优化', 'performance', '性能', '清理', 'cleanup', '提取', 'extract']
+
+/** 任务指纹 (P2-①): category 互斥类别 + eco 生态透传 + bucket 分桶键 + fp 完整指纹。 */
+export interface TaskFingerprint {
+  category: 'fix' | 'feature' | 'refactor' | 'unknown'
+  eco: string
+  bucket: string
+  fp: string
+}
+
+/** category 判定 (确定性, 互斥, 先命中先停): fix > feature > refactor, 全不中 → unknown。
+ * 只 goal.toLowerCase() 后 includes, 中文不 lower 无影响 (粗分类允许 unknown 合法存在)。 */
+function categoryOf(goal: string): TaskFingerprint['category'] {
+  const g = goal.toLowerCase()
+  if (CATEGORY_FIX.some(k => g.includes(k))) return 'fix'
+  if (CATEGORY_FEATURE.some(k => g.includes(k))) return 'feature'
+  if (CATEGORY_REFACTOR.some(k => g.includes(k))) return 'refactor'
+  return 'unknown'
+}
+
+/** 全角转半角 (U+FF01–U+FF5E 映射块 + 全角空格 U+3000): 标准全角→半角映射,
+ * 含全角字母数字与标点, 归一更彻底 (不影响 category — category 走原始 lowercased goal)。 */
+function toHalfWidth(s: string): string {
+  let out = ''
+  for (const ch of s) {
+    const code = ch.codePointAt(0) ?? 0
+    if (code === 0x3000) out += ' '
+    else if (code >= 0xff01 && code <= 0xff5e) out += String.fromCodePoint(code - 0xfee0)
+    else out += ch
+  }
+  return out
+}
+
+/** goal 归一化 (fp 字段用): trim → 全角转半角 → 连续空白压缩为单空格 → 截 80 → 转小写。 */
+function normalizeGoal(goal: string): string {
+  return toHalfWidth(goal.trim()).replace(/\s+/g, ' ').slice(0, 80).toLowerCase()
+}
+
+/** 任务指纹 (P2-①): 纯确定性分桶键, 供经验库"按可复现指纹分桶、跨类别不硬套"。
+ * 禁 LLM/禁随机; 同 (goal, workdir) 两次调用结果完全一致 (重放判据)。
+ * @param goal 任务目标 (category 判定不归一化, 空串 → unknown + fp 尾空串)
+ * @param workdir 工作目录 (绝对路径, workdir 不存在时 probeEcosystem 自身返回 none)
+ * @returns 指纹 {category, eco, bucket, fp} */
+export function taskFingerprint(goal: string, workdir: string): TaskFingerprint {
+  const category = categoryOf(goal)
+  const eco = probeEcosystem(workdir).eco
+  const bucket = `${category}:${eco}`
+  const fp = `${bucket}:${normalizeGoal(goal)}`
+  return { category, eco, bucket, fp }
+}
+
 /** TS 生态验收测试模板 (确定性): 只断言目标模块文件存在 (existsSync), 不虚构 import
  * 路径/符号约定 (与 Python 路径"不虚构人为约定"纪律一致; symbol 断言留待 P2 读 tsconfig paths)。
  * 签名有意只收 goal/module 两参: spec 草案的 tokens/symbol 仅服务 TS 符号断言, 本分支
@@ -1285,7 +1342,7 @@ export function buildEvidence(input: {
 
 /** runs 落盘记录 (P1-③): 纯函数组装 taijiRunInner 的 runs JSON 对象,
  * 抽离使「stats.reputation → runs JSON」可运行时断言 (非字符串证据)。
- * @param input 运行期变量 (reputation 为首次派单注入因子, 缺省落 null)
+ * @param input 运行期变量 (reputation 为首次派单注入因子, fingerprint 为任务指纹, 均缺省落 null)
  * @returns 与 taijiRunInner 内联对象逐字段一致的 runs 记录 */
 export function buildRunsRecord(input: {
   goal: string
@@ -1298,15 +1355,17 @@ export function buildRunsRecord(input: {
   rounds: Record<number, string>
   review: unknown
   reputation: unknown
+  fingerprint: unknown
   params: EffectiveParams
   evidence: unknown
 }): Record<string, unknown> {
-  const { goal, workdir, verify, sandbox, dims, converged, finalState, rounds, review, reputation, params, evidence } = input
+  const { goal, workdir, verify, sandbox, dims, converged, finalState, rounds, review, reputation, fingerprint, params, evidence } = input
   return {
     ts: Date.now(), goal, workdir, verify, sandbox, dims: dims ?? 'default',
     converged, finalState, roundsUsed: Object.keys(rounds).length,
     rounds, review: review ?? null,
     reputation: reputation ?? null,
+    fingerprint: fingerprint ?? null,
     params,
     evidence: evidence ?? null,
   }
@@ -1370,6 +1429,8 @@ async function taijiRunInner(
   let finalState = ''
   const stats: Record<string, unknown> = { sandbox, dims: dims ?? 'default' }
   stats.ecosystem = ecoInfo.eco
+  const fingerprint = taskFingerprint(goal, workdir)
+  stats.fingerprint = fingerprint
   let piBroken = false   // pi 通道失败一次后本轮跳过 (不再每代付 2min 超时)
 
   // P1-D: 收敛证据链"最新一代"快照 (循环外声明, 同 mechanicalGateBlock; 运行期逐代更新)
@@ -1618,6 +1679,7 @@ ${t.out.slice(-1500)}
         converged, finalState, rounds,
         review: stats.review,
         reputation: stats.reputation,
+        fingerprint,
         params: effectiveParams(),
         evidence,
       }), null, 2),
