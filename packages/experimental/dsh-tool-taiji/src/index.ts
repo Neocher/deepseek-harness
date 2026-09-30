@@ -269,6 +269,7 @@ export interface AuctionReputation {
  * @param gen 当前代数 (进竞标微扰种子)
  * @param warn 落盘告警回调 (缺省 console.warn)
  * @param excludeFiles 排除的文件集 (多目标换靶时传前 N-1 个 agent 已用文件)
+ * @param bucket 经验分桶键 (初始派单传 fingerprint.bucket; 缺省不注入经验)
  * @returns 竞标选中的文件 + 排序后的 agent 列表 + 刺激值 + 首次派单注入因子; 无候选返回 undefined */
 export function auction(
   pm: PheromoneMap,
@@ -276,7 +277,8 @@ export function auction(
   gen: number,
   warn: WarnFn = console.warn,
   excludeFiles?: string[],
-): { file: string; agents: string[]; stimulus: number; reputation?: AuctionReputation } | undefined {
+  bucket?: string,
+): { file: string; agents: string[]; stimulus: number; reputation?: AuctionReputation; experience?: AuctionExperience } | undefined {
   const candidates: string[] = []
   for (const [file, node] of Object.entries(pm)) {
     if ((node.Pe > 0 || node.Pr > 0) && !(excludeFiles ?? []).includes(file)) candidates.push(file)
@@ -287,12 +289,13 @@ export function auction(
   const s = stimulusOf(pm[file] ?? zeroNode)
   const weights = loadAgentWeights(workdir, warn)
   const reps = loadGlobalReputation(warn)
+  const expAgents = bucket !== undefined ? loadExperience(warn)[bucket]?.agents : undefined
   const scored: Array<{ agent: string; score: number }> = []
   for (const [agent, peak] of Object.entries(AGENT_PEAKS)) {
     const w = weights[agent] ?? 0
     const jitter = bidJitter(`${workdir}\0${file}\0${agent}\0${gen}`)
     const score = Math.exp(-(((s - peak) / 60) ** 2)) * (0.85 + jitter * 0.3) * (1 + w * 0.2)
-      * repFactor(reps[agent]) * streakPenalty(reps[agent])
+      * repFactor(reps[agent]) * streakPenalty(reps[agent]) * expFactor(expAgents?.[agent])
     scored.push({ agent, score })
   }
   scored.sort((a, b) => b.score - a.score)
@@ -306,6 +309,12 @@ export function auction(
         agent: top.agent,
         repFactor: repFactor(reps[top.agent]),
         streakPenalty: streakPenalty(reps[top.agent]),
+      },
+    } : {}),
+    ...(top && bucket !== undefined ? {
+      experience: {
+        bucket,
+        expFactor: expFactor(expAgents?.[top.agent]),
       },
     } : {}),
   }
@@ -371,8 +380,8 @@ export type ReputationMap = Record<string, AgentReputation>
 /** 注入阈值: 样本 (wins+losses) ≥ 5 才把胜率偏差注入竞标打分。 */
 const REP_MIN_SAMPLES = 5
 
-/** 乐观并发退避序列 (ms): 初始 1 次 + 3 次重试共 4 次写尝试, 第 4 次仍冲突则告警放弃。 */
-const REP_BACKOFF_MS = [50, 100, 200] as const
+/** 乐观并发退避序列 (ms): 初始 1 次 + 3 次重试共 4 次写尝试, 第 4 次仍冲突则告警放弃 (信誉与经验库共用)。 */
+const OPTIMISTIC_BACKOFF_MS = [50, 100, 200] as const
 
 /** 全局信誉文件路径: env TAIJI_GLOBAL_REP 非 '0' 时作覆盖路径, 缺省 ~/.taiji/global-agent-reputation.json。 */
 export function globalRepPath(): string {
@@ -386,19 +395,19 @@ export function globalRepDisabled(): boolean {
   return process.env.TAIJI_GLOBAL_REP === '0'
 }
 
-/** 全局信誉文件原始快照 (mtime + 内容, 乐观并发版本比对用)。文件不存在返回 undefined。 */
-interface GlobalRepSnapshot {
+/** 持久化文件原始快照 (mtime + 内容, 乐观并发版本比对用)。文件不存在返回 undefined。 */
+interface FileSnapshot {
   mtimeMs: number
   content: string
 }
 
-function readGlobalRepRaw(path: string): GlobalRepSnapshot | undefined {
+function readFileSnapshot(path: string): FileSnapshot | undefined {
   if (!existsSync(path)) return undefined
   return { mtimeMs: statSync(path).mtimeMs, content: readFileSync(path, 'utf-8') }
 }
 
 /** 快照版本比对: 两者均 undefined 视为一致; 否则 mtime 与内容均一致才视为未变。 */
-function snapshotsEqual(a: GlobalRepSnapshot | undefined, b: GlobalRepSnapshot | undefined): boolean {
+function snapshotsEqual(a: FileSnapshot | undefined, b: FileSnapshot | undefined): boolean {
   if (a === undefined || b === undefined) return a === b
   return a.mtimeMs === b.mtimeMs && a.content === b.content
 }
@@ -448,26 +457,191 @@ function sleepSync(ms: number): void {
   Atomics.wait(buf, 0, 0, ms)
 }
 
-/** 记录一次全局信誉 (乐观并发读-改-写 + 退避重试, 非锁)。
- * 每轮: 读快照 → 读+损坏 C4 → applyReputation 算 next → 再读快照比对;
- * 未变则原子写; 变了则退避重试; 初始 1 次 + 3 次重试共 4 次写尝试仍冲突 → 告警放弃不抛。
- * TAIJI_GLOBAL_REP=0 时 no-op; 写失败不阻断主循环。 */
-export function recordReputation(agent: string, win: boolean, warn: WarnFn = console.warn): void {
-  if (globalRepDisabled()) return
-  const path = globalRepPath()
-  const backoffs = REP_BACKOFF_MS
-  for (let attempt = 0; attempt <= backoffs.length; attempt++) {
-    const before = readGlobalRepRaw(path)
-    const map = loadGlobalReputation(warn)
-    const next: ReputationMap = { ...map, [agent]: applyReputation(map[agent], win) }
-    const after = readGlobalRepRaw(path)
+/** 乐观并发读-改-写 + 退避重试 (非锁), 供全局信誉 (recordReputation) 与经验库 (recordExperience) 复用。
+ * 每轮: 读快照 before → load() 得当前 map (含损坏 C4 纪律) → update(map) 算 next → 读快照 after;
+ * 快照未变则原子写 next 并返回; 变了则退避重试; 初始 1 次 + 3 次重试共 4 次写尝试仍冲突 → warn(conflictMsg) 放弃不抛。
+ * @param path 目标持久化文件路径
+ * @param load 读 + 损坏 C4 处理回调 (返回当前 map; 损坏时备份 .corrupt-* + 告警 + 返回空 map)
+ * @param update 读-改-写回调 (由当前 map 派生 next map, 纯函数)
+ * @param warn 落盘告警回调
+ * @param conflictMsg 冲突耗尽告警文案 */
+function optimisticUpdate<T extends Record<string, unknown>>(
+  path: string,
+  load: (warn: WarnFn) => T,
+  update: (map: T) => T,
+  warn: WarnFn,
+  conflictMsg: string,
+): void {
+  for (let attempt = 0; attempt <= OPTIMISTIC_BACKOFF_MS.length; attempt++) {
+    const before = readFileSnapshot(path)
+    const map = load(warn)
+    const next = update(map)
+    const after = readFileSnapshot(path)
     if (snapshotsEqual(before, after)) {
       try { atomicWriteJson(path, next) } catch { /* 写失败不阻断主循环 */ }
       return
     }
-    if (attempt < backoffs.length) sleepSync(backoffs[attempt] ?? 0)
+    if (attempt < OPTIMISTIC_BACKOFF_MS.length) sleepSync(OPTIMISTIC_BACKOFF_MS[attempt] ?? 0)
   }
-  warn(`[taiji] 全局信誉并发冲突, ${backoffs.length} 次重试仍失败, 放弃本次写入 (agent=${agent})`)
+  warn(conflictMsg)
+}
+
+/** 记录一次全局信誉 (乐观并发读-改-写 + 退避重试, 非锁, 经 optimisticUpdate)。
+ * TAIJI_GLOBAL_REP=0 时 no-op; 写失败不阻断主循环。 */
+export function recordReputation(agent: string, win: boolean, warn: WarnFn = console.warn): void {
+  if (globalRepDisabled()) return
+  optimisticUpdate(
+    globalRepPath(),
+    loadGlobalReputation,
+    map => ({ ...map, [agent]: applyReputation(map[agent], win) }),
+    warn,
+    `[taiji] 全局信誉并发冲突, ${OPTIMISTIC_BACKOFF_MS.length} 次重试仍失败, 放弃本次写入 (agent=${agent})`,
+  )
+}
+
+/** ── P2-②: 抽象经验库 A — 桶级统计经验 (跨 workdir 桶级胜率统计) ────────────
+ * 独立文件 ~/.taiji/global-experience.json (env TAIJI_EXP 覆盖路径, TAIJI_EXP=0 全局关闭)。
+ * 语义分离: 信誉=agent 全局慢变量; 经验=桶级慢变量 (谁在 category:eco 桶内胜率最高)。
+ * 硬约束: 只存 wins/losses 计数 (禁存 LLM 文本/时间戳), 注入只走 auction 打分乘数
+ * (expFactor) 不进 prompt — 模型看到的只是派单顺序变化, 无自然语言注入面。 */
+
+/** 单个 agent 在桶内的胜负计数 (只存计数)。 */
+export interface AgentExperience {
+  wins: number
+  losses: number
+}
+
+/** 桶级经验: 桶聚合 wins/losses + per-agent 明细 + best/worst 缓存 (load 时由明细重派生)。 */
+export interface BucketExperience {
+  wins: number
+  losses: number
+  bestAgent: string
+  worstAgent: string
+  updated: number
+  agents: Record<string, AgentExperience>
+}
+
+/** 经验地图: key = bucket (category:eco), value = 桶级经验。 */
+export type ExperienceMap = Record<string, BucketExperience>
+
+/** 竞标注入因子 (经验: 首次派单 top-1 agent 的桶内胜率注入状态)。 */
+export interface AuctionExperience {
+  bucket: string
+  expFactor: number
+}
+
+/** best/worst 竞争门槛: 样本 (wins+losses) < 3 的 agent 不参与 best/worst 竞争 (小样本不偏置)。 */
+const EXP_MIN_SAMPLES = 3
+
+/** 注入门槛: 该 agent 桶内样本 (wins+losses) >= 5 才把胜率偏差注入竞标打分 (±5%, 比全局信誉 ±10% 保守)。 */
+const EXP_INJECT_MIN_SAMPLES = 5
+
+/** 经验文件路径: env TAIJI_EXP 非 '0' 时作覆盖路径, 缺省 ~/.taiji/global-experience.json。 */
+export function expPath(): string {
+  const env = process.env.TAIJI_EXP
+  if (env && env !== '0') return env
+  return join(homedir(), '.taiji', 'global-experience.json')
+}
+
+/** TAIJI_EXP=0 → 全局关闭 (不读不写): loadExperience 返回 {}, recordExperience no-op。 */
+export function experienceDisabled(): boolean {
+  return process.env.TAIJI_EXP === '0'
+}
+
+/** 由 per-agent 明细派生 best/worst: 样本 < EXP_MIN_SAMPLES 不参与竞争;
+ * 平局 best 取插入序靠前 (先达标), worst 取插入序靠后 (后达标)。无竞争者均返回 ''。 */
+function deriveBestWorst(agents: Record<string, AgentExperience>): { bestAgent: string; worstAgent: string } {
+  let bestAgent = ''
+  let worstAgent = ''
+  let bestRate = -1
+  let worstRate = 2
+  for (const [agent, rec] of Object.entries(agents)) {
+    const sample = rec.wins + rec.losses
+    if (sample < EXP_MIN_SAMPLES) continue
+    const rate = rec.wins / sample
+    if (rate > bestRate) { bestRate = rate; bestAgent = agent }
+    if (rate <= worstRate) { worstRate = rate; worstAgent = agent }
+  }
+  return { bestAgent, worstAgent }
+}
+
+/** 读经验库 (损坏 C4 纪律: 备份 .corrupt-* + 告警 + 空重建); TAIJI_EXP=0 短路返回 {}。
+ * 逐桶用 agents 明细重派生 bestAgent/worstAgent, 缓存与明细不符以派生为准 (防半写)。 */
+export function loadExperience(warn: WarnFn = console.warn): ExperienceMap {
+  if (experienceDisabled()) return {}
+  const p = expPath()
+  try {
+    if (existsSync(p)) {
+      const raw = JSON.parse(readFileSync(p, 'utf-8')) as ExperienceMap
+      const out: ExperienceMap = {}
+      for (const [bucket, rec] of Object.entries(raw)) {
+        const { bestAgent, worstAgent } = deriveBestWorst(rec.agents)
+        out[bucket] = {
+          wins: rec.wins,
+          losses: rec.losses,
+          bestAgent,
+          worstAgent,
+          updated: rec.updated,
+          agents: rec.agents,
+        }
+      }
+      return out
+    }
+  } catch {
+    try { renameSync(p, `${p}.corrupt-${Date.now()}`) } catch { /* 备份失败不阻断 */ }
+    warn(`[taiji] 经验文件损坏, 已备份为 ${p}.corrupt-*, 重建为空`)
+  }
+  return {}
+}
+
+/** 桶级经验更新 (纯函数): 按 agent 累加 wins/losses, 同步桶聚合, 现场派生 best/worst。
+ * @param bucket 既有桶经验 (缺省视为空桶)
+ * @param agent 本次 agent
+ * @param ok 本次是否成功 (win)
+ * @param now 更新时刻 epoch ms (缺省 Date.now(); 单测注入固定值保确定性)
+ * @returns 更新后的桶经验 */
+export function applyExperience(
+  bucket: BucketExperience | undefined,
+  agent: string,
+  ok: boolean,
+  now: number = Date.now(),
+): BucketExperience {
+  const cur = bucket ?? { wins: 0, losses: 0, bestAgent: '', worstAgent: '', updated: now, agents: {} }
+  const agents = { ...cur.agents }
+  const prev = agents[agent] ?? { wins: 0, losses: 0 }
+  agents[agent] = ok
+    ? { wins: prev.wins + 1, losses: prev.losses }
+    : { wins: prev.wins, losses: prev.losses + 1 }
+  const { bestAgent, worstAgent } = deriveBestWorst(agents)
+  return {
+    wins: cur.wins + (ok ? 1 : 0),
+    losses: cur.losses + (ok ? 0 : 1),
+    bestAgent,
+    worstAgent,
+    updated: now,
+    agents,
+  }
+}
+
+/** 竞标注入因子 (桶内胜率偏差 ±5%): 样本 >= EXP_INJECT_MIN_SAMPLES 才注入, 否则 1.0 (不注入)。 */
+export function expFactor(exp: AgentExperience | undefined): number {
+  if (!exp) return 1
+  const sample = exp.wins + exp.losses
+  if (sample < EXP_INJECT_MIN_SAMPLES) return 1
+  return 1 + (exp.wins / sample - 0.5) * 0.1
+}
+
+/** 记录一次桶级经验 (乐观并发读-改-写 + 退避重试, 非锁, 与 recordReputation 同款)。
+ * TAIJI_EXP=0 时 no-op; 写失败不阻断主循环。 */
+export function recordExperience(bucket: string, agent: string, ok: boolean, warn: WarnFn = console.warn): void {
+  if (experienceDisabled()) return
+  optimisticUpdate(
+    expPath(),
+    loadExperience,
+    map => ({ ...map, [bucket]: applyExperience(map[bucket], agent, ok) }),
+    warn,
+    `[taiji] 经验并发冲突, ${OPTIMISTIC_BACKOFF_MS.length} 次重试仍失败, 放弃本次写入 (bucket=${bucket}, agent=${agent})`,
+  )
 }
 
 function stimulusOf(node: PheromoneNode): number {
@@ -1342,7 +1516,7 @@ export function buildEvidence(input: {
 
 /** runs 落盘记录 (P1-③): 纯函数组装 taijiRunInner 的 runs JSON 对象,
  * 抽离使「stats.reputation → runs JSON」可运行时断言 (非字符串证据)。
- * @param input 运行期变量 (reputation 为首次派单注入因子, fingerprint 为任务指纹, 均缺省落 null)
+ * @param input 运行期变量 (reputation/experience 为首次派单注入因子, fingerprint 为任务指纹, 均缺省落 null)
  * @returns 与 taijiRunInner 内联对象逐字段一致的 runs 记录 */
 export function buildRunsRecord(input: {
   goal: string
@@ -1355,16 +1529,21 @@ export function buildRunsRecord(input: {
   rounds: Record<number, string>
   review: unknown
   reputation: unknown
+  experience?: unknown
   fingerprint: unknown
   params: EffectiveParams
   evidence: unknown
 }): Record<string, unknown> {
-  const { goal, workdir, verify, sandbox, dims, converged, finalState, rounds, review, reputation, fingerprint, params, evidence } = input
+  const {
+    goal, workdir, verify, sandbox, dims, converged, finalState, rounds,
+    review, reputation, experience, fingerprint, params, evidence,
+  } = input
   return {
     ts: Date.now(), goal, workdir, verify, sandbox, dims: dims ?? 'default',
     converged, finalState, roundsUsed: Object.keys(rounds).length,
     rounds, review: review ?? null,
     reputation: reputation ?? null,
+    experience: experience ?? null,
     fingerprint: fingerprint ?? null,
     params,
     evidence: evidence ?? null,
@@ -1487,8 +1666,9 @@ async function taijiRunInner(
         rounds[gen] += ' | sandbox=restrict: 跳过修复(只读)'
         stats.sandbox_enforced = true
       } else {
-        const target = auction(pm, workdir, gen, warn)
+        const target = auction(pm, workdir, gen, warn, undefined, fingerprint.bucket)
         stats.reputation = target?.reputation
+        stats.experience = target?.experience
         if (target) {
           // P1-①: 多目标选择 — 第 N 个 agent 排除前 N-1 个 agent 已用文件, 打不同靶
           const usedFiles: string[] = []
@@ -1544,6 +1724,8 @@ ${t.out.slice(-1500)}
             updateAgentWeight(workdir, agent, weightDelta, warn)
             // P1-③: 全局信誉 (与 P0-⑥ 零变更门同信号源: win = 复测绿 + 相关变更, 其余一律 loss)
             recordReputation(agent, t2.ok && weightDelta > 0, warn)
+            // P2-②: 抽象经验 (桶级统计, 与 P1-③ 全局信誉同信号源: win = 复测绿 + 相关变更)
+            recordExperience(fingerprint.bucket, agent, t2.ok && weightDelta > 0, warn)
             // P1-C: 异源机械判官层 — 零变更门之后接线 (diffFiles 非空但含禁止模式/工具链缺失等硬 fail)
             const gates = await mechanicalGates({
               workdir,
@@ -1679,6 +1861,7 @@ ${t.out.slice(-1500)}
         converged, finalState, rounds,
         review: stats.review,
         reputation: stats.reputation,
+        experience: stats.experience,
         fingerprint,
         params: effectiveParams(),
         evidence,

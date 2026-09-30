@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs, { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync, mkdirSync, statSync, utimesSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { syncBuiltinESMExports } from 'node:module'
@@ -45,6 +45,12 @@ import {
   repFactor,
   streakPenalty,
   taskFingerprint,
+  expPath,
+  experienceDisabled,
+  loadExperience,
+  recordExperience,
+  applyExperience,
+  expFactor,
 } from '../src/index.js'
 
 let td: string
@@ -52,10 +58,13 @@ beforeEach(() => {
   td = mkdtempSync(join(tmpdir(), 'taiji-test-'))
   // 全局信誉文件路径注入 tmp 目录 (隔离, 不写真实 ~/.taiji)
   process.env.TAIJI_GLOBAL_REP = join(td, 'global-agent-reputation.json')
+  // 经验文件路径注入 tmp 目录 (隔离, 不写真实 ~/.taiji)
+  process.env.TAIJI_EXP = join(td, 'global-experience.json')
 })
 afterEach(() => {
   rmSync(td, { recursive: true, force: true })
   delete process.env.TAIJI_GLOBAL_REP
+  delete process.env.TAIJI_EXP
   delete process.env.TAIJI_VERIFY_SHELL_OK
   delete process.env.TAIJI_RANDOM_BID
   delete process.env.TAIJI_FAILED_FILE_RE
@@ -1073,5 +1082,201 @@ describe('P2-① 任务指纹', () => {
     expect(src).toContain('stats.fingerprint = fingerprint')
     expect(src).toContain('fingerprint: fingerprint ?? null')
     expect(src).toContain('reputation: stats.reputation,')
+  })
+})
+
+/** P2-②: 抽象经验库 A — 桶级统计经验 (跨 workdir 桶级胜率统计) */
+describe('P2-② 抽象经验库', () => {
+  it('expPath 默认 ~/.taiji/global-experience.json + TAIJI_EXP 覆盖路径 (AC-4)', () => {
+    expect(expPath()).toBe(join(td, 'global-experience.json'))
+    delete process.env.TAIJI_EXP
+    try {
+      expect(expPath()).toBe(join(homedir(), '.taiji', 'global-experience.json'))
+    } finally {
+      process.env.TAIJI_EXP = join(td, 'global-experience.json')
+    }
+  })
+
+  it('桶统计 + best/worst 派生 (平局: 先达标 best, 后达标 worst) (判据1)', () => {
+    const bucket = 'fix:python'
+    for (let i = 0; i < 5; i++) recordExperience(bucket, 'A', true, () => {})
+    for (let i = 0; i < 5; i++) recordExperience(bucket, 'B', true, () => {})
+    const rec = loadExperience(() => {})[bucket]
+    expect(rec?.wins).toBe(10)
+    expect(rec?.losses).toBe(0)
+    expect(rec?.bestAgent).toBe('A')
+    expect(rec?.worstAgent).toBe('B')
+    expect(typeof rec?.updated).toBe('number')
+    expect(rec?.agents).toEqual({ A: { wins: 5, losses: 0 }, B: { wins: 5, losses: 0 } })
+  })
+
+  it('小样本不参与 best/worst 竞争: 样本 2 胜率高也不当 best (判据2)', () => {
+    const now = 1_700_000_000_000
+    let b = applyExperience(undefined, 'A', true, now)
+    expect(b.bestAgent).toBe('')
+    expect(b.worstAgent).toBe('')
+    b = applyExperience(b, 'A', true, now)   // 样本 2, 胜率 100% 仍不当 best
+    expect(b.bestAgent).toBe('')
+    b = applyExperience(b, 'A', true, now)   // 样本 3 → 参与竞争
+    expect(b.bestAgent).toBe('A')
+  })
+
+  it('乐观并发重试合并: 冲突后重试, 最终态含两次更新 (判据3)', () => {
+    const path = expPath()
+    atomicWriteJson(path, {})
+    const original = fs.statSync
+    let statCalls = 0
+    const stat = vi.spyOn(fs, 'statSync')
+    try {
+      stat.mockImplementation(new Proxy(original, {
+        apply(target, receiver: unknown, args: unknown[]): unknown {
+          statCalls++
+          const result: unknown = Reflect.apply(target, receiver, args)
+          if (statCalls === 2) {
+            const map = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>
+            map['fix:python'] = {
+              wins: 1, losses: 0, bestAgent: 'B', worstAgent: 'B', updated: 1_700_000_000_000,
+              agents: { B: { wins: 1, losses: 0 } },
+            }
+            writeFileSync(path, JSON.stringify(map))
+          }
+          return result
+        },
+      }))
+      syncBuiltinESMExports()
+      recordExperience('fix:python', 'A', true, () => {})
+    } finally {
+      stat.mockRestore()
+      syncBuiltinESMExports()
+    }
+    const final = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, { agents: Record<string, { wins: number; losses: number }> }>
+    expect(final['fix:python']?.agents).toMatchObject({
+      A: { wins: 1, losses: 0 },
+      B: { wins: 1, losses: 0 },
+    })
+  })
+
+  it('连续 3 次冲突 → warn 告警且不抛错, 文件保持原样 (判据3)', () => {
+    const path = expPath()
+    atomicWriteJson(path, {})
+    const original = fs.statSync
+    let mtimeTick = Date.now() + 60_000
+    const stat = vi.spyOn(fs, 'statSync')
+    const warns: string[] = []
+    try {
+      stat.mockImplementation(new Proxy(original, {
+        apply(target, receiver: unknown, args: unknown[]): unknown {
+          const result: unknown = Reflect.apply(target, receiver, args)
+          mtimeTick += 1000
+          try { utimesSync(path, new Date(mtimeTick), new Date(mtimeTick)) } catch { /* 忽略 */ }
+          return result
+        },
+      }))
+      syncBuiltinESMExports()
+      expect(() => { recordExperience('fix:python', 'A', true, m => warns.push(m)) }).not.toThrow()
+    } finally {
+      stat.mockRestore()
+      syncBuiltinESMExports()
+    }
+    expect(warns.some(w => w.includes('冲突'))).toBe(true)
+    expect(JSON.parse(readFileSync(path, 'utf-8'))).toEqual({})
+  })
+
+  it('expFactor 数值: 100%样本10→1.05; 50%→1.0; 样本4→1.0; undefined→1.0 (判据4)', () => {
+    expect(expFactor({ wins: 10, losses: 0 })).toBeCloseTo(1.05, 5)
+    expect(expFactor({ wins: 5, losses: 5 })).toBeCloseTo(1.0, 5)
+    expect(expFactor({ wins: 4, losses: 0 })).toBe(1.0)
+    expect(expFactor(undefined)).toBe(1.0)
+  })
+
+  it('TAIJI_EXP=0 → load 返回 {} + record no-op 不触碰文件 (判据5)', () => {
+    process.env.TAIJI_EXP = '0'
+    const warns: string[] = []
+    expect(experienceDisabled()).toBe(true)
+    expect(loadExperience(m => warns.push(m))).toEqual({})
+    const stat = vi.spyOn(fs, 'statSync')
+    try {
+      syncBuiltinESMExports()
+      recordExperience('fix:python', 'A', true, m => warns.push(m))
+      expect(stat).not.toHaveBeenCalled()
+    } finally {
+      stat.mockRestore()
+      syncBuiltinESMExports()
+    }
+    expect(warns).toEqual([])
+  })
+
+  it('损坏经验文件 → .corrupt-* 备份 + 告警 + 空重建 (判据6)', () => {
+    const path = expPath()
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, '{broken')
+    const warns: string[] = []
+    expect(loadExperience(m => warns.push(m))).toEqual({})
+    expect(warns.some(w => w.includes('损坏'))).toBe(true)
+    expect(readdirSync(dirname(path)).some(f => f.includes('.corrupt-'))).toBe(true)
+    expect(existsSync(path)).toBe(false)
+  })
+
+  it('派生一致性: 缓存 bestAgent/worstAgent 与明细不符 → 以明细派生为准 (判据7)', () => {
+    const path = expPath()
+    mkdirSync(dirname(path), { recursive: true })
+    atomicWriteJson(path, {
+      'fix:python': {
+        wins: 4, losses: 2,
+        bestAgent: 'X',       // 缓存与明细不符 (A 3/3=100% 才是 best)
+        worstAgent: 'A',      // 缓存与明细不符 (B 1/3≈33% 才是 worst)
+        updated: 1_700_000_000_000,
+        agents: { A: { wins: 3, losses: 0 }, B: { wins: 1, losses: 2 } },
+      },
+    })
+    const rec = loadExperience(() => {})['fix:python']
+    expect(rec?.bestAgent).toBe('A')
+    expect(rec?.worstAgent).toBe('B')
+  })
+
+  it('auction 注入: bucket 传入 → experience 返回 + expFactor 一致 (AC-2)', () => {
+    atomicWriteJson(expPath(), {
+      'fix:python': {
+        wins: 10, losses: 3, bestAgent: 'claude_code', worstAgent: 'opencode',
+        updated: 1_700_000_000_000,
+        agents: {
+          claude_code: { wins: 10, losses: 0 },
+          opencode: { wins: 0, losses: 3 },
+        },
+      },
+    })
+    const pm = { 'a.py': { Pe: 90, Pr: 0, complexity: 0 } }
+    const r = auction(pm, td, 1, () => {}, undefined, 'fix:python')
+    expect(r).toBeDefined()
+    expect(r?.experience?.bucket).toBe('fix:python')
+    const expMap = loadExperience(() => {})
+    const topAgent = r?.agents?.[0] ?? ''
+    expect(r?.experience?.expFactor).toBeCloseTo(expFactor(expMap['fix:python']?.agents[topAgent]), 5)
+  })
+
+  it('接线 (结构断言): auction bucket + expFactor + stats.experience + recordExperience 同信号源 + runs 落盘', () => {
+    const src = readFileSync(resolve(__dirname, '../src/index.ts'), 'utf-8')
+    expect(src).toContain('* repFactor(reps[agent]) * streakPenalty(reps[agent]) * expFactor(expAgents?.[agent])')
+    expect(src).toContain('auction(pm, workdir, gen, warn, undefined, fingerprint.bucket)')
+    expect(src).toContain('stats.experience = target?.experience')
+    expect(src).toContain('recordExperience(fingerprint.bucket, agent, t2.ok && weightDelta > 0, warn)')
+    expect(src).toContain('experience: stats.experience,')
+    expect(src).toContain('experience: experience ?? null')
+  })
+
+  it('buildRunsRecord: stats.experience 落入 runs 记录 (行为断言, AC-2)', () => {
+    const base = {
+      goal: 'g', workdir: '/w', verify: 'true', sandbox: 'full', dims: undefined,
+      converged: false, finalState: '', rounds: { 1: 'x' },
+      review: undefined, reputation: undefined, fingerprint: undefined,
+      params: effectiveParams(), evidence: undefined,
+    }
+    const rec = buildRunsRecord({
+      ...base,
+      experience: { bucket: 'fix:python', expFactor: 1.05 },
+    })
+    expect(rec.experience).toEqual({ bucket: 'fix:python', expFactor: 1.05 })
+    const none = buildRunsRecord({ ...base })
+    expect(none.experience).toBeNull()
   })
 })
